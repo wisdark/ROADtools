@@ -19,6 +19,7 @@ export interface GroupsItem {
   membershipRule: string;
   memberOf: GroupsItem[];
   memberUsers: UsersItem[];
+  memberServicePrincipals: ServicePrincipalsItem[];
 }
 
 export interface DirectoryRolesItem {
@@ -113,9 +114,11 @@ export interface ServicePrincipalsItem {
   oauth2Permissions: object[];
   passwordCredentials: object;
   keyCredentials: object;
+  servicePrincipalType: string;
   ownerUsers: UsersItem[];
   ownerServicePrincipals: ServicePrincipalsItem[];
   memberOfRole: DirectoryRolesItem[];
+  memberOf: GroupsItem[];
 }
 
 export interface TenantDetail {

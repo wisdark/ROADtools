@@ -67,7 +67,7 @@ class SimpleServicePrincipalsSchema(ma.Schema):
 class ServicePrincipalsSchema(ma.Schema):
     class Meta:
         model = ServicePrincipal
-        fields = ('objectId', 'objectType', 'displayName', 'appDisplayName', 'appId', 'appOwnerTenantId', 'publisherName', 'replyUrls', 'appRoles', 'microsoftFirstParty', 'isDirSyncEnabled', 'oauth2Permissions', 'passwordCredentials', 'keyCredentials', 'ownerUsers', 'ownerServicePrincipals', 'accountEnabled')
+        fields = ('objectId', 'objectType', 'displayName', 'appDisplayName', 'appId', 'appOwnerTenantId', 'publisherName', 'replyUrls', 'appRoles', 'microsoftFirstParty', 'isDirSyncEnabled', 'oauth2Permissions', 'passwordCredentials', 'keyCredentials', 'ownerUsers', 'ownerServicePrincipals', 'accountEnabled', 'servicePrincipalType')
     ownerUsers = fields.Nested(UsersSchema, many=True)
     ownerServicePrincipals = fields.Nested(SimpleServicePrincipalsSchema, many=True)
 
@@ -104,6 +104,7 @@ class GroupSchema(RTModelSchema):
         model = Group
     memberOf = fields.Nested(GroupsSchema, many=True)
     memberUsers = fields.Nested(UsersSchema, many=True)
+    memberServicePrincipals = fields.Nested(SimpleServicePrincipalsSchema, many=True)
 
 class ServicePrincipalSchema(RTModelSchema):
     class Meta(RTModelSchema.Meta):
@@ -111,6 +112,7 @@ class ServicePrincipalSchema(RTModelSchema):
     ownerUsers = fields.Nested(UsersSchema, many=True)
     ownerServicePrincipals = fields.Nested(ServicePrincipalsSchema, many=True)
     memberOfRole = fields.Nested(DirectoryRoleSchema, many=True)
+    memberOf = fields.Nested(GroupSchema, many=True)
 
 
 class ApplicationSchema(RTModelSchema):

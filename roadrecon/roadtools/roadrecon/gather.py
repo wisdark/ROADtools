@@ -282,7 +282,7 @@ class DataDumper(object):
         self.session.commit()
 
     async def dump_custom_role_members(self, dbtype):
-        parents = self.session.query(RoleDefinition).filter(RoleDefinition.isBuiltIn == False)
+        parents = self.session.query(RoleDefinition).all()
         cache = []
         for parent in parents:
             url = 'https://graph.windows.net/%s/roleAssignments?api-version=%s&$filter=roleDefinitionId eq \'%s\'' % (self.tenantid, self.api_version, parent.objectId)
@@ -341,6 +341,7 @@ async def run(args, dburl):
         'Microsoft.DirectoryServices.Group': (Group, 'memberGroups'),
         'Microsoft.DirectoryServices.Contact': (Contact, 'memberContacts'),
         'Microsoft.DirectoryServices.Device': (Device, 'memberDevices'),
+        'Microsoft.DirectoryServices.ServicePrincipal': (ServicePrincipal, 'memberServicePrincipals'),
     }
     owner_mapping = {
         'Microsoft.DirectoryServices.User': (User, 'ownerUsers'),

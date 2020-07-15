@@ -26,19 +26,25 @@ import platform
 import os
 import json
 import argparse
+import sys
 from roadtools.roadlib.metadef.database import ServicePrincipal, User, Group, DirectoryRole
 import roadtools.roadlib.metadef.database as database
 try:
-    from neo4j.v1 import GraphDatabase
+    from neo4j import GraphDatabase
     from neo4j.exceptions import ClientError
     HAS_NEO_MODULE = True
 except ModuleNotFoundError:
-    HAS_NEO_MODULE = False
+    try:
+        from neo4j.v1 import GraphDatabase
+        from neo4j.exceptions import ClientError
+        HAS_NEO_MODULE = True
+    except ModuleNotFoundError:
+        HAS_NEO_MODULE = False
 
 DESCRIPTION = '''
 Export ROADrecon data into BloodHound's neo4j database.
 Requires a custom version of the BloodHound interface to use, available at
-https://github.com/dirkjanm/cloudhound
+https://github.com/dirkjanm/BloodHound-AzureAD
 '''
 
 BASE_LINK_QUERY = 'UNWIND $props AS prop MERGE (n:{0} {{objectid: prop.source}}) MERGE (m:{1} {{objectid: prop.target}}) MERGE (n)-[r:{2}]->(m)';
@@ -192,6 +198,8 @@ class BloodHoundPlugin():
                     add_edge(neosession, memberuser.objectId, 'AzureUser', group.objectId, 'AzureGroup', 'MemberOf')
                 for membergroup in group.memberGroups:
                     add_edge(neosession, membergroup.objectId, 'AzureGroup', group.objectId, 'AzureGroup', 'MemberOf')
+                for membersp in group.memberServicePrincipals:
+                    add_edge(neosession, membersp.objectId, 'AzureGroup', group.objectId, 'ServicePrincipal', 'MemberOf')
 
 
             for role in self.session.query(DirectoryRole):
@@ -224,6 +232,7 @@ def add_args(parser):
 def main(args=None):
     if not HAS_NEO_MODULE:
         print('neo4j python module not found! Please install the module neo4j-driver first (pip install neo4j-driver)')
+        sys.exit(1)
         return
     if args is None:
         parser = argparse.ArgumentParser(add_help=True, description='ROADrecon policies to HTML plugin', formatter_class=argparse.RawDescriptionHelpFormatter)
