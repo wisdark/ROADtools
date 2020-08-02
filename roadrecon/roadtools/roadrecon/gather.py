@@ -302,7 +302,7 @@ async def run(args, dburl):
     elif args.tenant:
         tenantid = args.tenant
     else:
-        tenantid = 'myorganisation'
+        tenantid = 'myorganization'
     expiretime = time.mktime(time.strptime(token['expiresOn'].split('.')[0], '%Y-%m-%d %H:%M:%S'))
     headers = {
         'Authorization': '%s %s' % (token['tokenType'], token['accessToken'])
@@ -388,6 +388,10 @@ def getargs(gather_parser):
     gather_parser.add_argument('--mfa',
                                action='store_true',
                                help='Dump MFA details (requires use of a privileged account)')
+    gather_parser.add_argument('-t',
+                               '--tenant',
+                               action='store',
+                               help='Tenant ID to gather, if this info is not stored in the token')
 
 def main(args=None):
     global token, headers, dburl, urlcounter
