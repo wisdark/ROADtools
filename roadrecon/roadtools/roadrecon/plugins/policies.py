@@ -181,7 +181,8 @@ class AccessPoliciesPlugin():
                     raise Exception('Unsupported criterium type: {0}'.format(ctype))
             else:
                 if not 'Guests' in clist:
-                    raise Exception('Unmatched object(s): {0}'.format(','.join(clist)))
+                    ot += 'Unknown object(s) {0}'.format(', '.join(clist))
+                    print('Warning: Not all object IDs could be resolved for this policy')
         return ot
 
     def _parse_appcrit(self, crit):
@@ -189,6 +190,9 @@ class AccessPoliciesPlugin():
         for ctype, clist in crit.items():
             if 'All' in clist:
                 ot += 'All applications'
+                break
+            if 'None' in clist:
+                ot += 'None'
                 break
             if 'Office365' in clist:
                 ot += 'All Office 365 applications'
@@ -257,9 +261,13 @@ class AccessPoliciesPlugin():
         for policy in policies:
             for pdetail in policy.policyDetail:
                 detaildata = json.loads(pdetail)
-
-                if detaildata['KnownNetworkPolicies']['NetworkId'] in locs:
+                if 'KnownNetworkPolicies' in detaildata and detaildata['KnownNetworkPolicies']['NetworkId'] in locs:
                     out.append(detaildata['KnownNetworkPolicies']['NetworkName'])
+        # New format
+        for loc in locs:
+            policies = self.session.query(Policy).filter(Policy.policyType == 6 and Policy.policyIdentifier == loc)
+            for policy in policies:
+                out.append(policy.displayName)
         return out
 
     def _parse_who(self, cond):
@@ -296,7 +304,10 @@ class AccessPoliciesPlugin():
         if 'Block' in acontrols:
             ot = '<strong>Deny logon</strong>'
             return ot
-        ot = '<strong>Requirements</strong>: '
+        if len(controls) > 1:
+            ot = '<strong>Requirements (all)</strong>: '
+        else:
+            ot = '<strong>Requirements (any)</strong>: '
         ot += ', '.join(acontrols)
         return ot
 
@@ -315,6 +326,12 @@ class AccessPoliciesPlugin():
             for icrit in ucond['Exclude']:
                 ot += ', '.join([escape(crit) for crit in icrit['ClientTypes']])
         return ot
+
+    def _parse_sessioncontrols(self, cond):
+        if not 'SessionControls' in cond:
+            return ''
+        ucond = cond['SessionControls']
+        return ', '.join(ucond)
 
     def main(self, should_print=False):
         pp = pprint.PrettyPrinter(indent=4)
@@ -342,6 +359,7 @@ class AccessPoliciesPlugin():
             out['platforms'] = self._parse_platform(conditions)
             out['locations'] = self._parse_locations(conditions)
             out['clients'] = self._parse_clients(conditions)
+            out['sessioncontrols'] = self._parse_sessioncontrols(detail)
 
             try:
                 controls = detail['Controls']
@@ -361,10 +379,14 @@ class AccessPoliciesPlugin():
                 table += '<tr><td>Using clients</td><td>{0}</td></tr>'.format(out['clients'])
             if out['locations'] != '':
                 table += '<tr><td>At locations</td><td>{0}</td></tr>'.format(out['locations'])
-            table += '<tr><td>Controls</td><td>{0}</td></tr>'.format(out['controls'])
+            if out['controls'] != '':
+                table += '<tr><td>Controls</td><td>{0}</td></tr>'.format(out['controls'])
+            if out['sessioncontrols'] != '':
+                table += '<tr><td>Session controls</td><td>{0}</td></tr>'.format(out['sessioncontrols'])
             table += '</tbody>'
             html += table
         self.write_html(self.file, html)
+        print('Results written to {0}'.format(self.file))
 
 def add_args(parser):
     parser.add_argument('-f',

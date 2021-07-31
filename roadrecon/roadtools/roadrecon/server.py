@@ -8,6 +8,7 @@ from roadtools.roadlib.metadef.database import User, JSON, Group, DirectoryRole,
 import os
 import argparse
 from sqlalchemy import func
+import mimetypes
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -15,6 +16,8 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # This will get initialized later on
 db = None
 ma = Marshmallow(app)
+
+mimetypes.add_type('application/javascript', '.js')
 
 # Allow CORS requests from Angular if it's running in develop mode
 CORS(app, origins=['http://127.0.0.1:4200', 'http://localhost:4200', 'http://localhost:5000'])
@@ -50,10 +53,18 @@ class DirectoryRoleSchema(ma.Schema):
         model = DirectoryRole
         fields = ('displayName', 'description')
 
+class OAuth2PermissionGrantsSchema(ma.SQLAlchemyAutoSchema):
+    class Meta:
+        model = OAuth2PermissionGrant
+
+class AppRoleAssignmentsSchema(ma.SQLAlchemyAutoSchema):
+    class Meta:
+        model = AppRoleAssignment
+
 class GroupsSchema(ma.Schema):
     class Meta:
         model = Group
-        fields = ('displayName', 'description', 'createdDateTime', 'dirSyncEnabled', 'objectId', 'mail')
+        fields = ('displayName', 'description', 'createdDateTime', 'dirSyncEnabled', 'objectId', 'objectType', 'mail', 'isPublic')
 
 class SimpleServicePrincipalsSchema(ma.Schema):
     """
@@ -83,6 +94,7 @@ class DirectoryRolesSchema(RTModelSchema):
         model = DirectoryRole
     memberUsers = fields.Nested(UsersSchema, many=True)
     memberServicePrincipals = fields.Nested(ServicePrincipalsSchema, many=True)
+    memberGroups = fields.Nested(GroupsSchema, many=True)
 
 class UserSchema(RTModelSchema):
     class Meta(RTModelSchema.Meta):
@@ -113,7 +125,8 @@ class ServicePrincipalSchema(RTModelSchema):
     ownerServicePrincipals = fields.Nested(ServicePrincipalsSchema, many=True)
     memberOfRole = fields.Nested(DirectoryRoleSchema, many=True)
     memberOf = fields.Nested(GroupSchema, many=True)
-
+    oauth2PermissionGrants = fields.Nested(OAuth2PermissionGrantsSchema, many=True)
+    appRolesAssigned = fields.Nested(AppRoleAssignmentsSchema, many=True)
 
 class ApplicationSchema(RTModelSchema):
     class Meta(RTModelSchema.Meta):
@@ -202,22 +215,23 @@ def group_detail(id):
     if not group:
         abort(404)
     return group_schema.jsonify(group)
-import json
+
 @app.route("/api/serviceprincipals", methods=["GET"])
 def get_sps():
     all_sps = db.session.query(ServicePrincipal).all()
     result = serviceprincipals_schema.dump(all_sps)
-    for obj in result:
-        try:
-            json.dumps(obj)
-        except TypeError:
-            import pprint
-            pprint.pprint(obj)
     return serviceprincipals_schema.jsonify(all_sps)
 
 @app.route("/api/serviceprincipals/<id>", methods=["GET"])
 def sp_detail(id):
     sp = db.session.query(ServicePrincipal).get(id)
+    if not sp:
+        abort(404)
+    return serviceprincipal_schema.jsonify(sp)
+
+@app.route("/api/serviceprincipals-by-appid/<id>", methods=["GET"])
+def sp_detail_by_appid(id):
+    sp = db.session.query(ServicePrincipal).filter(ServicePrincipal.appId == id).first()
     if not sp:
         abort(404)
     return serviceprincipal_schema.jsonify(sp)
@@ -230,6 +244,12 @@ def get_applications():
 
 @app.route("/api/mfa", methods=["GET"])
 def get_mfa():
+    # First get all users with per-user MFA
+    per_user = db.session.query(AppRoleAssignment).filter(AppRoleAssignment.resourceDisplayName == "MicrosoftAzureActiveAuthn" and AppRoleAssignment.principalType == "User").all()
+    enabledusers = []
+    for approle in per_user:
+        enabledusers.append(approle.principalId)
+
     all_mfa = db.session.query(User).all()
     out = []
     for user in all_mfa:
@@ -243,6 +263,7 @@ def get_mfa():
             'displayName': user.displayName,
             'mfamethods': mfa_methods,
             'accountEnabled': user.accountEnabled,
+            'perusermfa': user.objectId in enabledusers,
             'has_app': has_app,
             'has_phonenr': has_phonenr,
             'has_fido': has_fido,

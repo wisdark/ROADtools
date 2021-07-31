@@ -133,7 +133,7 @@ class Authentication():
         """
         label = b"AzureAD-SecureConversation"
         if not context:
-            context = os.urandom(32)
+            context = os.urandom(24)
         else:
             context = binascii.unhexlify(context)
         backend = default_backend()
@@ -407,7 +407,7 @@ class Authentication():
             return self.authenticate_with_refresh(token_data)
         if self.access_token and not self.refresh_token:
             tokens = self.access_token.split('.')
-            inputdata = json.loads(base64.b64decode(tokens[1]))
+            inputdata = json.loads(base64.b64decode(tokens[1]+('='*(len(tokens[1])%4))))
             self.tokendata = {
                 'accessToken': self.access_token,
                 'tokenType': 'Bearer',

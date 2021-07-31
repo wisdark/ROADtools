@@ -15,11 +15,14 @@ export interface GroupsItem {
   createdDateTime: string;
   dirSyncEnabled: string;
   objectId: string;
+  objectType: string;
   mail: string;
+  isPublic: boolean;
   membershipRule: string;
   memberOf: GroupsItem[];
   memberUsers: UsersItem[];
   memberServicePrincipals: ServicePrincipalsItem[];
+  memberOfRole: DirectoryRolesItem[];
 }
 
 export interface DirectoryRolesItem {
@@ -29,11 +32,13 @@ export interface DirectoryRolesItem {
   roleTemplateId: string;
   memberUsers: UsersItem[];
   memberServicePrincipals: ServicePrincipalsItem[];
+  memberGroups: GroupsItem[];
 }
 
 export interface ApplicationsItem {
   objectId: string;
   displayName: string;
+  appId: string;
   availableToOtherTenants: boolean;
   oauth2AllowIdTokenImplicitFlow: boolean;
   oauth2AllowImplicitFlow: boolean;
@@ -78,6 +83,7 @@ export interface MfaItem {
   objectId: string;
   displayName: string;
   mfamethods: number;
+  perusermfa: boolean;
   has_app: boolean;
   has_phonenr: boolean;
   has_fido: boolean;
@@ -150,6 +156,7 @@ export interface AppRolesItem {
 export interface DevicesItem {
   objectId: string;
   accountEnabled: boolean;
+  bitLockerKey: object[];
   deviceCategory: string;
   deviceId: string;
   deviceKey: object;
@@ -167,6 +174,7 @@ export interface DevicesItem {
   dirSyncEnabled: boolean;
   displayName: string;
   domainName: string;
+  owner: UsersItem[];
 }
 
 @Injectable({
@@ -206,6 +214,10 @@ export class DatabaseService {
 
   public getServicePrincipal(id):  Observable<ServicePrincipalsItem> {
       return this.http.get<ServicePrincipalsItem>(environment.apibase + 'serviceprincipals/'+ id);
+  }
+
+  public getServicePrincipalByAppId(id):  Observable<ServicePrincipalsItem> {
+      return this.http.get<ServicePrincipalsItem>(environment.apibase + 'serviceprincipals-by-appid/'+ id);
   }
 
   public getApplications():  Observable<ApplicationsItem[]> {
@@ -350,3 +362,27 @@ export class ServicePrincipalsResolveService implements Resolve<ServicePrincipal
     );
   }
 }
+
+@Injectable({
+  providedIn: 'root',
+})
+export class ServicePrincipalsByAppIdResolveService implements Resolve<ServicePrincipalsItem> {
+  constructor(private dbservice: DatabaseService, private router: Router) {}
+
+  resolve(route: ActivatedRouteSnapshot, state: RouterStateSnapshot): Observable<ServicePrincipalsItem> | Observable<never> {
+    let id = route.paramMap.get('id');
+
+    return this.dbservice.getServicePrincipalByAppId(id).pipe(
+      mergeMap(serviceprincipal => {
+        if (serviceprincipal) {
+          this.router.navigate(['/serviceprincipals', serviceprincipal.objectId]);
+          return EMPTY;
+        } else { // id not found
+          this.router.navigate(['/serviceprincipals']);
+          return EMPTY;
+        }
+      })
+    );
+  }
+}
+
