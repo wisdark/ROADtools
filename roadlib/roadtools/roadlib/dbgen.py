@@ -31,14 +31,20 @@ class DateTime(TypeDecorator):
             # Sometimes it ends on a Z, sometimes it doesn't
             if value[-1] == 'Z':
                 if '.' in value:
-                    value = datetime.datetime.strptime(value[:-2], '%Y-%m-%dT%H:%M:%S.%f')
+                    try:
+                        value = datetime.datetime.strptime(value[:-2], '%Y-%m-%dT%H:%M:%S.%f')
+                    except ValueError:
+                        value = datetime.datetime.strptime(value[:-2], '%Y-%m-%dT%H:%M:%S.')
                 else:
                     value = datetime.datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ')
             elif '.' in value:
                 if '+' in value:
                     value = datetime.datetime.strptime(value[:-7], '%Y-%m-%dT%H:%M:%S.%f')
                 else:
-                    value = datetime.datetime.strptime(value[:-1], '%Y-%m-%dT%H:%M:%S.%f')
+                    try:
+                        value = datetime.datetime.strptime(value[:-1], '%Y-%m-%dT%H:%M:%S.%f')
+                    except ValueError:
+                        value = datetime.datetime.strptime(value[:-1], '%Y-%m-%dT%H:%M:%S.')
             else:
                 value = datetime.datetime.strptime(value, '%Y-%m-%dT%H:%M:%S')
 

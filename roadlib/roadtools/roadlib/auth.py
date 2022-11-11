@@ -7,14 +7,44 @@ import datetime
 import uuid
 import binascii
 import time
-from urllib.parse import urlparse, parse_qs
+import codecs
+from urllib.parse import urlparse, parse_qs, quote_plus
 import os
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization, padding, hashes
 from cryptography.hazmat.primitives.kdf.kbkdf import CounterLocation, KBKDFHMAC, Mode
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import requests
 import adal
 import jwt
+
+
+
+WELLKNOWN_RESOURCES = {
+    "msgraph": "https://graph.microsoft.com/",
+    "aadgraph": "https://graph.windows.net/",
+    "devicereg": "urn:ms-drs:enterpriseregistration.windows.net",
+    "drs": "urn:ms-drs:enterpriseregistration.windows.net",
+    "azrm": "https://management.core.windows.net/",
+    "azurerm": "https://management.core.windows.net/",
+}
+
+WELLKNOWN_CLIENTS = {
+    "aadps": "1b730954-1685-4b74-9bfd-dac224a7b894",
+    "azcli": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+    "teams": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
+    "msteams": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
+    "azps": "1950a258-227b-4e31-a9cf-717495945fc2",
+}
+
+def get_data(data):
+    return base64.urlsafe_b64decode(data+('='*(len(data)%4)))
+
+class AuthenticationException(Exception):
+    """
+    Generic exception we can throw when auth fails so that the error
+    goes back to the user.
+    """
 
 class Authentication():
     """
@@ -24,7 +54,8 @@ class Authentication():
         self.username = username
         self.password = password
         self.tenant = tenant
-        self.client_id = client_id
+        self.client_id = None
+        self.set_client_id(client_id)
         self.resource_uri = 'https://graph.windows.net/'
         self.tokendata = {}
         self.refresh_token = None
@@ -42,6 +73,18 @@ class Authentication():
         if self.tenant is not None:
             return 'https://login.microsoftonline.com/{}'.format(self.tenant)
         return 'https://login.microsoftonline.com/common'
+
+    def set_client_id(self, clid):
+        """
+        Sets client ID to use (accepts aliases)
+        """
+        self.client_id = self.lookup_client_id(clid)
+
+    def set_resource_uri(self, uri):
+        """
+        Sets resource URI to use (accepts aliases)
+        """
+        self.resource_uri = self.lookup_resource_uri(uri)
 
     def authenticate_device_code(self):
         """
@@ -66,7 +109,6 @@ class Authentication():
         self.tokendata = context.acquire_token_with_username_password(self.resource_uri, self.username, self.password, self.client_id)
 
         return self.tokendata
-
 
     def authenticate_as_app(self):
         """
@@ -100,22 +142,147 @@ class Authentication():
         # Overwrite fields
         for ikey, ivalue in newtokendata.items():
             self.tokendata[ikey] = ivalue
+        access_token = newtokendata['accessToken']
+        tokens = access_token.split('.')
+        inputdata = json.loads(base64.b64decode(tokens[1]+('='*(len(tokens[1])%4))))
+        self.tokendata['_clientId'] = self.client_id
+        self.tokendata['tenantId'] = inputdata['tid']
         return self.tokendata
+
+    def authenticate_with_code_native(self, code, redirurl, client_secret=None, pkce_secret=None):
+        """
+        Authenticate with a code plus optional secret in case of a non-public app (authorization grant)
+        Native ROADlib implementation without adal requirement - also supports PKCE
+        """
+        authority_uri = self.get_authority_url()
+        data = {
+            "client_id": self.client_id,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirurl,
+            "resource": self.resource_uri,
+        }
+        if client_secret:
+            data['client_secret'] = client_secret
+        if pkce_secret:
+            raise NotImplementedError
+        res = requests.post(f"{authority_uri}/oauth2/token", data=data)
+        if res.status_code != 200:
+            raise AuthenticationException(res.text)
+        tokenreply = res.json()
+        self.tokendata = self.tokenreply_to_tokendata(tokenreply)
+        return self.tokendata
+
+    def authenticate_with_code_encrypted(self, code, sessionkey, redirurl):
+        '''
+        Encrypted code redemption. Like normal code flow but requires
+        session key to decrypt response.
+        '''
+        authority_uri = self.get_authority_url()
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirurl,
+            "client_id": self.client_id,
+            "client_info":1,
+            "windows_api_version":"2.0"
+        }
+        res = requests.post(f"{authority_uri}/oauth2/token", data=data)
+        if res.status_code != 200:
+            raise AuthenticationException(res.text)
+        prtdata = res.text
+        data = self.decrypt_auth_response(prtdata, sessionkey, asjson=True)
+        return data
+
+    def build_auth_url(self, redirurl, response_type, scope=None, state=None):
+        '''
+        Build authorize URL. Can be v2 by specifying scope, otherwise defaults
+        to v1 with resource
+        '''
+        urlt_v2 = 'https://login.microsoftonline.com/{3}/oauth2/v2.0/authorize?response_type={4}&client_id={0}&scope={2}&redirect_uri={1}&state={5}'
+        urlt_v1 = 'https://login.microsoftonline.com/{3}/oauth2/authorize?response_type={4}&client_id={0}&resource={2}&redirect_uri={1}&state={5}'
+        if not state:
+            state = str(uuid.uuid4())
+        if not self.tenant:
+            tenant = 'common'
+        else:
+            tenant = self.tenant
+        if scope:
+            # v2
+            return urlt_v2.format(
+                quote_plus(self.client_id),
+                quote_plus(redirurl),
+                quote_plus(scope),
+                quote_plus(tenant),
+                quote_plus(response_type),
+                quote_plus(state)
+            )
+        # Else default to v1 identity endpoint
+        return urlt_v1.format(
+            quote_plus(self.client_id),
+            quote_plus(redirurl),
+            quote_plus(self.resource_uri),
+            quote_plus(tenant),
+            quote_plus(response_type),
+            quote_plus(state)
+        )
+
+    def create_prt_cookie_kdf_ver_2(self, prt, sessionkey, nonce=None):
+        """
+        KDF version 2 cookie construction
+        """
+        context = os.urandom(24)
+        headers = {
+            'ctx': base64.b64encode(context).decode('utf-8'), #.rstrip('=')
+            'kdf_ver': 2
+        }
+        # Nonce should be requested by calling function, otherwise
+        # old time based model is used
+        if nonce:
+            payload = {
+                "refresh_token": prt,
+                "is_primary": "true",
+                "request_nonce": nonce
+            }
+        else:
+            payload = {
+                "refresh_token": prt,
+                "is_primary": "true",
+                "iat": '{}'.format(int(time.time()))
+            }
+        # Sign with random key just to get jwt body in right encoding
+        tempjwt = jwt.encode(payload, os.urandom(32), algorithm='HS256', headers=headers)
+        jbody = tempjwt.split('.')[1]
+        jwtbody = base64.b64decode(jbody+('='*(len(jbody)%4)))
+
+        # Now calculate the derived key based on random context plus jwt body
+        _, derived_key = self.calculate_derived_key_v2(sessionkey, context, jwtbody)
+        cookie = jwt.encode(payload, derived_key, algorithm='HS256', headers=headers)
+        return cookie
+
+    def authenticate_with_prt_v2(self, prt, sessionkey):
+        """
+        KDF version 2 PRT auth
+        """
+        nonce = self.get_prt_cookie_nonce()
+        if not nonce:
+            return False
+
+        cookie = self.create_prt_cookie_kdf_ver_2(prt, sessionkey, nonce)
+        return self.authenticate_with_prt_cookie(cookie)
 
     def authenticate_with_prt(self, prt, context, derived_key=None, sessionkey=None):
         """
         Authenticate with a PRT and given context/derived key
+        Uses KDF version 1 (legacy)
         """
         # If raw key specified, use that
         if not derived_key and sessionkey:
             context, derived_key = self.calculate_derived_key(sessionkey, context)
-        secret = derived_key.replace(' ','')
-        sdata = binascii.unhexlify(secret)
+
         headers = {
-            'ctx': base64.b64encode(binascii.unhexlify(context)).decode('utf-8') #.rstrip('=')
+            'ctx': base64.b64encode(context).decode('utf-8'),
         }
-        if not '_' in prt:
-            prt = base64.b64decode(prt+('='*(len(prt)%4))).decode('utf-8')
         nonce = self.get_prt_cookie_nonce()
         if not nonce:
             return False
@@ -124,8 +291,19 @@ class Authentication():
             "is_primary": "true",
             "request_nonce": nonce
         }
-        cookie = jwt.encode(payload, sdata, algorithm='HS256', headers=headers).decode('utf-8')
+        cookie = jwt.encode(payload, derived_key, algorithm='HS256', headers=headers)
         return self.authenticate_with_prt_cookie(cookie)
+
+    def calculate_derived_key_v2(self, sessionkey, context, jwtbody):
+        """
+        Derived key calculation v2, which uses the JWT body
+        """
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(context)
+        digest.update(jwtbody)
+        kdfcontext = digest.finalize()
+        # From here on identical to v1
+        return self.calculate_derived_key(sessionkey, kdfcontext)
 
     def calculate_derived_key(self, sessionkey, context=None):
         """
@@ -134,8 +312,6 @@ class Authentication():
         label = b"AzureAD-SecureConversation"
         if not context:
             context = os.urandom(24)
-        else:
-            context = binascii.unhexlify(context)
         backend = default_backend()
         kdf = KBKDFHMAC(
             algorithm=hashes.SHA256(),
@@ -149,17 +325,50 @@ class Authentication():
             fixed=None,
             backend=backend
         )
-        if len(sessionkey) == 44:
-            keybytes = base64.b64decode(sessionkey)
+        derived_key = kdf.derive(sessionkey)
+        return context, derived_key
+
+    def decrypt_auth_response(self, responsedata, sessionkey, asjson=False):
+        """
+        Decrypt an encrypted authentication response, which is a JWE
+        encrypted using the sessionkey
+        """
+        if responsedata[:2] == '{"':
+            # This doesn't appear encrypted
+            if asjson:
+                return json.loads(responsedata)
+            return responsedata
+        dataparts = responsedata.split('.')
+
+        headers = json.loads(get_data(dataparts[0]))
+        _, derived_key = self.calculate_derived_key(sessionkey, base64.b64decode(headers['ctx']))
+        data = dataparts[3]
+        iv = dataparts[2]
+
+        cipher = Cipher(algorithms.AES(derived_key), modes.CBC(get_data(iv)))
+        decryptor = cipher.decryptor()
+        decrypted_data = decryptor.update(get_data(data)) + decryptor.finalize()
+        unpadder = padding.PKCS7(128).unpadder()
+        depadded_data = unpadder.update(decrypted_data) + unpadder.finalize()
+        if asjson:
+            jdata = json.loads(depadded_data)
+            return jdata
         else:
-            keybytes = binascii.unhexlify(sessionkey)
-        derived_key = kdf.derive(keybytes)
-        # This is not ideal but further code expects it as hex string
-        return binascii.hexlify(context).decode('utf-8'), binascii.hexlify(derived_key).decode('utf-8')
+            return depadded_data
+
+    def get_srv_challenge(self):
+        """
+        Request server challenge (nonce) to use with a PRT
+        """
+        data = {'grant_type':'srv_challenge'}
+        res = requests.post('https://login.microsoftonline.com/common/oauth2/token', data=data)
+        return res.json()
 
     def get_prt_cookie_nonce(self):
         """
-        Request a nonce to sign in with
+        Request a nonce to sign in with. This nonce is taken from the sign-in page, which
+        is how Chrome processes it, but it could probably also be obtained using the much
+        simpler request from the get_srv_challenge function.
         """
         ses = requests.session()
         params = {
@@ -237,8 +446,7 @@ class Authentication():
 
         # If a derived key was specified, we use that
         if derived_key:
-            secret = derived_key.replace(' ', '')
-            sdata = binascii.unhexlify(secret)
+            sdata = derived_key
             headers = jwt.get_unverified_header(cookie)
             if context is None or verify_only:
                 # Verify JWT
@@ -257,18 +465,17 @@ class Authentication():
             nonce = self.get_prt_cookie_nonce()
             jdata['request_nonce'] = nonce
             if context:
-                # Resign with custom context
-                # convert from ascii to base64
+                # Resign with custom context, should be in base64
                 newheaders = {
-                    'ctx': base64.b64encode(binascii.unhexlify(context)).decode('utf-8') #.rstrip('=')
+                    'ctx': base64.b64encode(context).decode('utf-8') #.rstrip('=')
                 }
-                cookie = jwt.encode(jdata, sdata, algorithm='HS256', headers=newheaders).decode('utf-8')
+                cookie = jwt.encode(jdata, sdata, algorithm='HS256', headers=newheaders)
                 print('Re-signed PRT cookie using custom context')
             else:
                 newheaders = {
                     'ctx': headers['ctx']
                 }
-                cookie = jwt.encode(jdata, sdata, algorithm='HS256', headers=newheaders).decode('utf-8')
+                cookie = jwt.encode(jdata, sdata, algorithm='HS256', headers=newheaders)
                 print('Re-signed PRT cookie using derived key')
 
         ses = requests.session()
@@ -359,7 +566,7 @@ class Authentication():
                                  help='Initialize Primary Refresh Token authentication flow (get nonce)')
         auth_parser.add_argument('--prt',
                                  action='store',
-                                 help='Primary Refresh Token cookie from mimikatz CloudAP')
+                                 help='Primary Refresh Token')
         auth_parser.add_argument('--derived-key',
                                  action='store',
                                  help='Derived key used to re-sign the PRT cookie (as hex key)')
@@ -372,6 +579,9 @@ class Authentication():
         auth_parser.add_argument('--prt-verify',
                                  action='store_true',
                                  help='Verify the Primary Refresh Token and exit')
+        auth_parser.add_argument('--kdf-v1',
+                                 action='store_true',
+                                 help='Use the older KDF version for PRT auth, may not work with PRTs from modern OSs')
         auth_parser.add_argument('-f',
                                  '--tokenfile',
                                  action='store',
@@ -385,16 +595,141 @@ class Authentication():
                                  help='Enable debug logging to disk')
         return auth_parser
 
+    @staticmethod
+    def ensure_binary_derivedkey(derived_key):
+        if not derived_key:
+            return None
+        secret = derived_key.replace(' ','')
+        sdata = binascii.unhexlify(secret)
+        return sdata
+
+    @staticmethod
+    def ensure_binary_sessionkey(sessionkey):
+        if not sessionkey:
+            return None
+        if len(sessionkey) == 44:
+            keybytes = base64.b64decode(sessionkey)
+        else:
+            sessionkey = sessionkey.replace(' ','')
+            keybytes = binascii.unhexlify(sessionkey)
+        return keybytes
+
+    @staticmethod
+    def ensure_binary_context(context):
+        if not context:
+            return None
+        return binascii.unhexlify(context)
+
+    @staticmethod
+    def ensure_plain_prt(prt):
+        if not prt:
+            return None
+        # May be base64 encoded
+        if not '.' in prt:
+            prt = base64.b64decode(prt+('='*(len(prt)%4))).decode('utf-8')
+        return prt
+
+    @staticmethod
+    def parse_accesstoken(token):
+        tokenparts = token.split('.')
+        tokendata = json.loads(get_data(tokenparts[1]))
+        tokenobject = {
+            'accessToken': token,
+            'tokenType': 'Bearer',
+            'expiresOn': datetime.datetime.fromtimestamp(tokendata['exp']).strftime('%Y-%m-%d %H:%M:%S'),
+            'tenantId': tokendata['tid'],
+            '_clientId': tokendata['appid']
+        }
+        return tokenobject, tokendata
+
+    @staticmethod
+    def tokenreply_to_tokendata(tokenreply):
+        """
+        Convert /token reply from Azure to ADAL compatible object
+        """
+        tokenobject = {
+            'tokenType': tokenreply['token_type'],
+            'expiresOn': datetime.datetime.fromtimestamp(int(tokenreply['expires_on'])).strftime('%Y-%m-%d %H:%M:%S')
+        }
+        translate_map = {
+            'access_token': 'accessToken',
+            'refresh_token': 'refreshToken',
+            'id_token': 'idToken',
+            'token_type': 'tokenType'
+        }
+        for newname, oldname in translate_map.items():
+            if newname in tokenreply:
+                tokenobject[oldname] = tokenreply[newname]
+        return tokenobject
+
+    @staticmethod
+    def parse_compact_jwe(jwe, verbose=False, decode_header=True):
+        """
+        Parse compact JWE according to
+        https://datatracker.ietf.org/doc/html/rfc7516#section-3.1
+        """
+        dataparts = jwe.split('.')
+        header, enc_key, iv, ciphertext, auth_tag = dataparts
+        parsed_header = json.loads(get_data(header))
+        if verbose:
+            print("Header (decoded):")
+            print(json.dumps(parsed_header, sort_keys=True, indent=4))
+            print("Encrypted key:")
+            print(enc_key)
+            print('IV:')
+            print(iv)
+            print("Ciphertext:")
+            print(ciphertext)
+            print("Auth tag:")
+            print(auth_tag)
+        if decode_header:
+            return parsed_header, enc_key, iv, ciphertext, auth_tag
+        return header, enc_key, iv, ciphertext, auth_tag
+
+    @staticmethod
+    def parse_jwt(jwt):
+        """
+        Simple JWT parsing function
+        returns header and body as dict and signature as bytes
+        """
+        dataparts = jwt.split('.')
+        header = json.loads(get_data(dataparts[0]))
+        body = json.loads(get_data(dataparts[1]))
+        signature = get_data(dataparts[2])
+        return header, body, signature
+
+    @staticmethod
+    def lookup_resource_uri(uri):
+        """
+        Translate resource URI aliases
+        """
+        try:
+            resolved = WELLKNOWN_RESOURCES[uri.lower()]
+            return resolved
+        except KeyError:
+            return uri
+
+    @staticmethod
+    def lookup_client_id(clid):
+        """
+        Translate client ID aliases
+        """
+        try:
+            resolved = WELLKNOWN_CLIENTS[clid.lower()]
+            return resolved
+        except KeyError:
+            return clid
+
     def parse_args(self, args):
         self.username = args.username
         self.password = args.password
         self.tenant = args.tenant
-        self.client_id = args.client
+        self.set_client_id(args.client)
         self.access_token = args.access_token
         self.refresh_token = args.refresh_token
         self.outfile = args.tokenfile
         self.debug = args.debug
-        self.resource_uri = args.resource
+        self.set_resource_uri(args.resource)
 
         if not self.username is None and self.password is None:
             self.password = getpass.getpass()
@@ -403,18 +738,14 @@ class Authentication():
         if self.tokendata:
             return self.tokendata
         if self.refresh_token and not self.access_token:
-            token_data = {'refreshToken': self.refresh_token}
+            if self.refresh_token == 'file':
+                with codecs.open(args.tokenfile, 'r', 'utf-8') as infile:
+                    token_data = json.load(infile)
+            else:
+                token_data = {'refreshToken': self.refresh_token}
             return self.authenticate_with_refresh(token_data)
         if self.access_token and not self.refresh_token:
-            tokens = self.access_token.split('.')
-            inputdata = json.loads(base64.b64decode(tokens[1]+('='*(len(tokens[1])%4))))
-            self.tokendata = {
-                'accessToken': self.access_token,
-                'tokenType': 'Bearer',
-                'expiresOn': datetime.datetime.fromtimestamp(inputdata['exp']).strftime('%Y-%m-%d %H:%M:%S'),
-                'tenantId': inputdata['tid'],
-                '_clientId': inputdata['appid']
-            }
+            self.tokendata, _ = self.parse_accesstoken(self.access_token)
             return self.tokendata
         if self.username and self.password:
             return self.authenticate_username_password()
@@ -428,11 +759,22 @@ class Authentication():
                 print('Requested nonce from server to use with ROADtoken: %s' % nonce)
             return False
         if args.prt_cookie:
-            return self.authenticate_with_prt_cookie(args.prt_cookie, args.prt_context, args.derived_key, args.prt_verify, args.prt_sessionkey)
+            derived_key = self.ensure_binary_derivedkey(args.derived_key)
+            context = self.ensure_binary_context(args.prt_context)
+            sessionkey = self.ensure_binary_sessionkey(args.prt_sessionkey)
+            return self.authenticate_with_prt_cookie(args.prt_cookie, context, derived_key, args.prt_verify, sessionkey)
         if args.prt and args.prt_context and args.derived_key:
-            return self.authenticate_with_prt(args.prt, args.prt_context, derived_key=args.derived_key)
+            derived_key = self.ensure_binary_derivedkey(args.derived_key)
+            context = self.ensure_binary_context(args.prt_context)
+            prt = self.ensure_plain_prt(args.prt)
+            return self.authenticate_with_prt(prt, context, derived_key=derived_key)
         if args.prt and args.prt_sessionkey:
-            return self.authenticate_with_prt(args.prt, args.prt_context, sessionkey=args.prt_sessionkey)
+            prt = self.ensure_plain_prt(args.prt)
+            sessionkey = self.ensure_binary_sessionkey(args.prt_sessionkey)
+            if args.kdf_v1:
+                return self.authenticate_with_prt(prt, None, sessionkey=sessionkey)
+            else:
+                return self.authenticate_with_prt_v2(prt, sessionkey)
         # If we are here, no auth to try
         print('Not enough information was supplied to authenticate')
         return False
@@ -441,7 +783,7 @@ class Authentication():
         if args.tokens_stdout:
             sys.stdout.write(json.dumps(self.tokendata))
         else:
-            with open(self.outfile, 'w') as outfile:
+            with codecs.open(self.outfile, 'w', 'utf-8') as outfile:
                 json.dump(self.tokendata, outfile)
             print('Tokens were written to {}'.format(self.outfile))
 

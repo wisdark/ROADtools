@@ -13,14 +13,14 @@ jobs:
 
   strategy:
     matrix:
-      Python36:
-        python.version: '3.6'
       Python37:
         python.version: '3.7'
       Python38:
         python.version: '3.8'
       Python39:
         python.version: '3.9'
+      Python310:
+        python.version: '3.10'
   steps:
   - task: UsePythonVersion@0
     inputs:
@@ -45,6 +45,12 @@ jobs:
     workingDirectory: roadrecon
 
   - script: |
+      pip install .
+      find roadtools/ -name '*.py' -exec python -m py_compile {} \;
+    displayName: 'Install roadtx'
+    workingDirectory: roadtx
+
+  - script: |
       roadrecon -h
       roadrecon-gui -h
       roadrecon plugin bloodhound -h
@@ -55,6 +61,17 @@ jobs:
       rm .roadtools_auth
       rm caps.html
     displayName: 'Run ROADrecon gathering tests'
+    env:
+      rtuser: $(rtuser)
+      rtpass: $(rtpass)
+
+  - script: |
+      roadtx -h
+      roadtx gettokens -u $rtuser -p $rtpass
+      roadtx gettokens -u $rtuser -p $rtpass -c azcli -r azrm
+      roadtx gettokens --refresh-token file -c msteams
+      rm .roadtools_auth
+    displayName: 'Run basic roadtx tests'
     env:
       rtuser: $(rtuser)
       rtpass: $(rtpass)
@@ -92,7 +109,7 @@ jobs:
       pip install .
       python setup.py sdist
       python setup.py bdist_wheel
-    displayName: 'Create ROADlib package'
+    displayName: 'Create roadlib package'
     workingDirectory: roadlib
 
   - script: |
@@ -101,6 +118,13 @@ jobs:
       python setup.py bdist_wheel
     displayName: 'Create ROADrecon package'
     workingDirectory: roadrecon
+
+  - script: |
+      pip install .
+      python setup.py sdist
+      python setup.py bdist_wheel
+    displayName: 'Create roadtx package'
+    workingDirectory: roadtx
 
   - task: CopyFiles@2
     displayName: 'Copy ROADrecon Files to: $(build.artifactstagingdirectory)'
@@ -114,6 +138,14 @@ jobs:
     displayName: 'Copy ROADlib Files to: $(build.artifactstagingdirectory)'
     inputs:
       SourceFolder: 'roadlib/dist/'
+      Contents: '*'
+      TargetFolder: '$(build.artifactstagingdirectory)'
+    condition: succeededOrFailed()
+
+  - task: CopyFiles@2
+    displayName: 'Copy roadtx Files to: $(build.artifactstagingdirectory)'
+    inputs:
+      SourceFolder: 'roadtx/dist/'
       Contents: '*'
       TargetFolder: '$(build.artifactstagingdirectory)'
     condition: succeededOrFailed()
