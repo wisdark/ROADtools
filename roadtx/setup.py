@@ -1,7 +1,7 @@
 from setuptools import setup
 setup(name='roadtx',
-      version='1.0.1',
-      description='Azure AD Token eXchange',
+      version='1.2.0',
+      description='ROADtools Token eXchange',
       author='Dirk-jan Mollema',
       author_email='dirkjan@outsidersecurity.nl',
       url='https://github.com/dirkjanm/ROADtools/',
@@ -17,7 +17,7 @@ setup(name='roadtx',
       ],
       packages=['roadtools.roadtx'],
       install_requires=[
-          'roadlib>=0.14',
+          'roadlib>=0.15',
           'requests',
           'selenium',
           'selenium-wire',

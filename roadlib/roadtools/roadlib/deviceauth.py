@@ -12,6 +12,7 @@ import requests
 import os
 import time
 import warnings
+import datetime
 from cryptography.hazmat.primitives import serialization, padding, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import padding as apadding
@@ -47,6 +48,11 @@ class DeviceAuthentication():
         self.hellokey = None
         # Hello key as PEM
         self.hellokeydata = None
+
+        # Proxies
+        self.proxies = {}
+        # Verify TLS certs
+        self.verify = True
 
     def loadcert(self, pemfile=None, privkeyfile=None, pfxfile=None, pfxpass=None, pfxbase64=None):
         """
@@ -228,7 +234,7 @@ class DeviceAuthentication():
         }
 
         print('Registering device')
-        res = requests.post('https://enterpriseregistration.windows.net/EnrollmentServer/device/?api-version=2.0', json=data, headers=headers)
+        res = requests.post('https://enterpriseregistration.windows.net/EnrollmentServer/device/?api-version=2.0', json=data, headers=headers, proxies=self.proxies, verify=self.verify)
         returndata = res.json()
         if not 'Certificate' in returndata:
             print('Error registering device! Got response:')
@@ -238,6 +244,109 @@ class DeviceAuthentication():
         # There is only one, so print it
         for attribute in cert.subject:
             print(f"Device ID: {attribute.value}")
+        with open(certout, "wb") as certf:
+            certf.write(cert.public_bytes(serialization.Encoding.PEM))
+        print(f'Saved device certificate to {certout}')
+        return True
+
+    def register_hybrid_device(self, objectsid, tenantid, certout=None, privout=None, device_type=None, device_name=None, os_version=None):
+        '''
+        Register hybrid device. Requires existing key/cert to be already loaded and the SID to be specified.
+        Device should be synced to AAD already, otherwise this will fail.
+        '''
+        # Fill in names if not supplied
+        if not device_name:
+            device_name = 'DESKTOP-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+        certout = device_name.lower() + '_aad.pem'
+        privout = device_name.lower() + '_aad.key'
+
+        if not device_type:
+            device_type = "Windows"
+
+        if not os_version:
+            os_version = "10.0.19041.928"
+
+        # Generate our new shiny key
+        key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+        )
+        # Write device key to disk
+        print(f'Saving private key to {privout}')
+        with open(privout, "wb") as keyf:
+            keyf.write(key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ))
+
+        # Generate a CSR
+        csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "7E980AD9-B86D-4306-9425-9AC066FB014A"),
+        ])).sign(key, hashes.SHA256())
+
+        # Get parameters needed to construct the CNG blob
+        certreq = csr.public_bytes(serialization.Encoding.DER)
+        certbytes = base64.b64encode(certreq)
+
+        pubkeycngblob = base64.b64encode(self.create_pubkey_blob_from_key(key))
+        curtime = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        signdata = f"{objectsid}.{curtime}Z"
+        signedblob = base64.b64encode(self.privkey.sign(
+            signdata.encode('utf-8'),
+            apadding.PKCS1v15(),
+            hashes.SHA256()
+        ))
+
+        data = {
+            "CertificateRequest":
+                {
+                    "Type": "pkcs10",
+                    "Data": certbytes.decode('utf-8')
+                },
+            "ServerAdJoinData":
+            {
+                "TransportKey": pubkeycngblob.decode('utf-8'),
+                "TargetDomain": "iminyour.cloud",
+                "DeviceType": device_type,
+                "OSVersion": os_version,
+                "DeviceDisplayName": device_name,
+                "TargetDomainId": f"{tenantid}",
+                "ClientIdentity":
+                {
+                    "Type": "sha256signed",
+                    "Sid": signdata,
+                    "SignedBlob": signedblob.decode('utf-8')
+                }
+            },
+            # Hybrid join = 6
+            "JoinType": 6,
+            "attributes": {
+                "ReuseDevice": "true",
+                "ReturnClientSid": "true"
+            }
+        }
+
+        headers = {
+            'User-Agent': f'Dsreg/10.0 (Windows {os_version})',
+            'Content-Type': 'application/json'
+        }
+        # Extract device ID from certificate
+        for attr in self.certificate.subject:
+            deviceid = attr.value
+        print(f"Device ID (from certificate): {deviceid}")
+        print('Registering device')
+        res = requests.put(f'https://enterpriseregistration.windows.net/EnrollmentServer/device/{deviceid}?api-version=2.0', json=data, headers=headers, proxies=self.proxies, verify=self.verify)
+        returndata = res.json()
+        if not 'Certificate' in returndata:
+            print('Error registering device! Got response:')
+            pprint.pprint(returndata)
+            return False
+        cert = x509.load_der_x509_certificate(base64.b64decode(returndata['Certificate']['RawBody']))
+        # There is only one, so print it
+        for attribute in cert.subject:
+            print(f"AAD device ID: {attribute.value}")
         with open(certout, "wb") as certf:
             certf.write(cert.public_bytes(serialization.Encoding.PEM))
         print(f'Saved device certificate to {certout}')
@@ -279,7 +388,7 @@ class DeviceAuthentication():
             'client_info':'1',
             'tgt':True
         }
-        res = requests.post('https://login.microsoftonline.com/common/oauth2/token', data=prt_request_data)
+        res = requests.post('https://login.microsoftonline.com/common/oauth2/token', data=prt_request_data, proxies=self.proxies, verify=self.verify)
         if res.status_code != 200:
             raise AuthenticationException(res.text)
         prtdata = res.json()
@@ -341,7 +450,7 @@ class DeviceAuthentication():
         }
         if reqtgt:
             token_request_data['tgt'] = True
-        res = requests.post('https://login.microsoftonline.com/common/oauth2/token', data=token_request_data)
+        res = requests.post('https://login.microsoftonline.com/common/oauth2/token', data=token_request_data, proxies=self.proxies, verify=self.verify)
         if res.status_code != 200:
             raise AuthenticationException(res.text)
         responsedata = res.text

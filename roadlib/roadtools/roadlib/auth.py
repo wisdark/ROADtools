@@ -11,6 +11,7 @@ import codecs
 from urllib.parse import urlparse, parse_qs, quote_plus
 import os
 from cryptography.hazmat.primitives import serialization, padding, hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.kbkdf import CounterLocation, KBKDFHMAC, Mode
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -35,6 +36,10 @@ WELLKNOWN_CLIENTS = {
     "teams": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
     "msteams": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
     "azps": "1950a258-227b-4e31-a9cf-717495945fc2",
+    "msedge": "ecd6b820-32c2-49b6-98a6-444530e5a77a",
+    "edge": "ecd6b820-32c2-49b6-98a6-444530e5a77a",
+    "msbroker": "29d9ed98-a469-4536-ade2-f981bc1d605e",
+    "broker": "29d9ed98-a469-4536-ade2-f981bc1d605e"
 }
 
 def get_data(data):
@@ -64,6 +69,7 @@ class Authentication():
         self.verify = True
         self.outfile = None
         self.debug = False
+        self.scope = None
 
     def get_authority_url(self):
         """
@@ -149,7 +155,58 @@ class Authentication():
         self.tokendata['tenantId'] = inputdata['tid']
         return self.tokendata
 
-    def authenticate_with_code_native(self, code, redirurl, client_secret=None, pkce_secret=None):
+    def authenticate_with_refresh_native(self, refresh_token, client_secret=None, additionaldata=None, returnreply=False):
+        """
+        Authenticate with a refresh token plus optional secret in case of a non-public app (authorization grant)
+        Native ROADlib implementation without adal requirement
+        """
+        authority_uri = self.get_authority_url()
+        data = {
+            "client_id": self.client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "resource": self.resource_uri,
+        }
+        if client_secret:
+            data['client_secret'] = client_secret
+        if additionaldata:
+            data = {**data, **additionaldata}
+        res = requests.post(f"{authority_uri}/oauth2/token", data=data, proxies=self.proxies, verify=self.verify)
+        if res.status_code != 200:
+            raise AuthenticationException(res.text)
+        tokenreply = res.json()
+        if returnreply:
+            return tokenreply
+        self.tokendata = self.tokenreply_to_tokendata(tokenreply)
+        return self.tokendata
+
+    def authenticate_with_refresh_native_v2(self, refresh_token, client_secret=None, additionaldata=None, returnreply=False):
+        """
+        Authenticate with a refresh token plus optional secret in case of a non-public app (authorization grant)
+        Native ROADlib implementation without adal requirement
+        This function calls identity platform v2 and thus requires a scope instead of resource
+        """
+        authority_uri = self.get_authority_url()
+        data = {
+            "client_id": self.client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": self.scope,
+        }
+        if client_secret:
+            data['client_secret'] = client_secret
+        if additionaldata:
+            data = {**data, **additionaldata}
+        res = requests.post(f"{authority_uri}/oauth2/v2.0/token", data=data, proxies=self.proxies, verify=self.verify)
+        if res.status_code != 200:
+            raise AuthenticationException(res.text)
+        tokenreply = res.json()
+        if returnreply:
+            return tokenreply
+        self.tokendata = self.tokenreply_to_tokendata(tokenreply)
+        return self.tokendata
+
+    def authenticate_with_code_native(self, code, redirurl, client_secret=None, pkce_secret=None, additionaldata=None, returnreply=False):
         """
         Authenticate with a code plus optional secret in case of a non-public app (authorization grant)
         Native ROADlib implementation without adal requirement - also supports PKCE
@@ -164,12 +221,45 @@ class Authentication():
         }
         if client_secret:
             data['client_secret'] = client_secret
+        if additionaldata:
+            data = {**data, **additionaldata}
         if pkce_secret:
             raise NotImplementedError
-        res = requests.post(f"{authority_uri}/oauth2/token", data=data)
+        res = requests.post(f"{authority_uri}/oauth2/token", data=data, proxies=self.proxies, verify=self.verify)
         if res.status_code != 200:
             raise AuthenticationException(res.text)
         tokenreply = res.json()
+        if returnreply:
+            return tokenreply
+        self.tokendata = self.tokenreply_to_tokendata(tokenreply)
+        return self.tokendata
+
+    def authenticate_with_code_native_v2(self, code, redirurl, client_secret=None, pkce_secret=None, additionaldata=None, returnreply=False):
+        """
+        Authenticate with a code plus optional secret in case of a non-public app (authorization grant)
+        Native ROADlib implementation without adal requirement - also supports PKCE
+        This function calls identity platform v2 and thus requires a scope instead of resource
+        """
+        authority_uri = self.get_authority_url()
+        data = {
+            "client_id": self.client_id,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirurl,
+            "scope": self.scope,
+        }
+        if client_secret:
+            data['client_secret'] = client_secret
+        if additionaldata:
+            data = {**data, **additionaldata}
+        if pkce_secret:
+            raise NotImplementedError
+        res = requests.post(f"{authority_uri}/oauth2/v2.0/token", data=data, proxies=self.proxies, verify=self.verify)
+        if res.status_code != 200:
+            raise AuthenticationException(res.text)
+        tokenreply = res.json()
+        if returnreply:
+            return tokenreply
         self.tokendata = self.tokenreply_to_tokendata(tokenreply)
         return self.tokendata
 
@@ -187,7 +277,7 @@ class Authentication():
             "client_info":1,
             "windows_api_version":"2.0"
         }
-        res = requests.post(f"{authority_uri}/oauth2/token", data=data)
+        res = requests.post(f"{authority_uri}/oauth2/token", data=data, proxies=self.proxies, verify=self.verify)
         if res.status_code != 200:
             raise AuthenticationException(res.text)
         prtdata = res.text
@@ -344,12 +434,20 @@ class Authentication():
         _, derived_key = self.calculate_derived_key(sessionkey, base64.b64decode(headers['ctx']))
         data = dataparts[3]
         iv = dataparts[2]
-
-        cipher = Cipher(algorithms.AES(derived_key), modes.CBC(get_data(iv)))
-        decryptor = cipher.decryptor()
-        decrypted_data = decryptor.update(get_data(data)) + decryptor.finalize()
-        unpadder = padding.PKCS7(128).unpadder()
-        depadded_data = unpadder.update(decrypted_data) + unpadder.finalize()
+        authtag = dataparts[4]
+        if len(get_data(iv)) == 12:
+            # This appears to be actual AES GCM
+            aesgcm = AESGCM(derived_key)
+            # JWE header is used as additional data
+            # Totally legit source: https://github.com/AzureAD/microsoft-authentication-library-common-for-objc/compare/dev...kedicl/swift/addframework#diff-ec15357c1b0dba2f2304f64750e5126ec910156f09c0f75eba0bb22cb83ada6dR46
+            # Also hinted at in RFC examples https://www.rfc-editor.org/rfc/rfc7516.txt
+            depadded_data = aesgcm.decrypt(get_data(iv), get_data(data) + get_data(authtag), dataparts[0].encode('utf-8'))
+        else:
+            cipher = Cipher(algorithms.AES(derived_key), modes.CBC(get_data(iv)))
+            decryptor = cipher.decryptor()
+            decrypted_data = decryptor.update(get_data(data)) + decryptor.finalize()
+            unpadder = padding.PKCS7(128).unpadder()
+            depadded_data = unpadder.update(decrypted_data) + unpadder.finalize()
         if asjson:
             jdata = json.loads(depadded_data)
             return jdata
@@ -361,7 +459,7 @@ class Authentication():
         Request server challenge (nonce) to use with a PRT
         """
         data = {'grant_type':'srv_challenge'}
-        res = requests.post('https://login.microsoftonline.com/common/oauth2/token', data=data)
+        res = requests.post('https://login.microsoftonline.com/common/oauth2/token', data=data, proxies=self.proxies, verify=self.verify)
         return res.json()
 
     def get_prt_cookie_nonce(self):
@@ -371,12 +469,14 @@ class Authentication():
         simpler request from the get_srv_challenge function.
         """
         ses = requests.session()
+        ses.proxies = self.proxies
+        ses.verify = self.verify
         params = {
             'resource': self.resource_uri,
             'client_id': self.client_id,
             'response_type': 'code',
             'haschrome': '1',
-            'redirect_uri': 'urn:ietf:wg:oauth:2.0:oob',
+            'redirect_uri': 'https://login.microsoftonline.com/common/oauth2/nativeclient',
             'client-request-id': str(uuid.uuid4()),
             'x-client-SKU': 'PCL.Desktop',
             'x-client-Ver': '3.19.7.16602',
@@ -423,7 +523,7 @@ class Authentication():
                 return nonce
 
 
-    def authenticate_with_prt_cookie(self, cookie, context=None, derived_key=None, verify_only=False, sessionkey=None):
+    def authenticate_with_prt_cookie(self, cookie, context=None, derived_key=None, verify_only=False, sessionkey=None, redirurl=None, return_code=False):
         """
         Authenticate with a PRT cookie, optionally re-signing the cookie if a key is given
         """
@@ -479,12 +579,14 @@ class Authentication():
                 print('Re-signed PRT cookie using derived key')
 
         ses = requests.session()
+        ses.proxies = self.proxies
+        ses.verify = self.verify
+        authority_uri = self.get_authority_url()
         params = {
-            'resource': self.resource_uri,
             'client_id': self.client_id,
             'response_type': 'code',
             'haschrome': '1',
-            'redirect_uri': 'urn:ietf:wg:oauth:2.0:oob',
+            'redirect_uri': 'https://login.microsoftonline.com/common/oauth2/nativeclient',
             'client-request-id': str(uuid.uuid4()),
             'x-client-SKU': 'PCL.Desktop',
             'x-client-Ver': '3.19.7.16602',
@@ -494,6 +596,16 @@ class Authentication():
             'sso_nonce': nonce,
             'mscrid': str(uuid.uuid4())
         }
+        if self.scope:
+            # Switch to identity platform v2 endpoint
+            params['scope'] = self.scope
+            url = f'{authority_uri}/oauth2/v2.0/authorize'
+            coderedeemfunc = self.authenticate_with_code_native_v2
+        else:
+            params['resource'] = self.resource_uri
+            url = f'{authority_uri}/oauth2/authorize'
+            coderedeemfunc = self.authenticate_with_code_native
+
         headers = {
             'User-Agent': 'Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 10.0; Win64; x64; Trident/7.0; .NET4.0C; .NET4.0E)',
             'UA-CPU': 'AMD64',
@@ -501,16 +613,47 @@ class Authentication():
         cookies = {
             'x-ms-RefreshTokenCredential': cookie
         }
-        res = ses.get('https://login.microsoftonline.com/Common/oauth2/authorize', params=params, headers=headers, cookies=cookies, allow_redirects=False)
+        if redirurl:
+            params['redirect_uri'] = redirurl
+
+        res = ses.get(url, params=params, headers=headers, cookies=cookies, allow_redirects=False)
         if res.status_code == 302 and params['redirect_uri'].lower() in res.headers['Location'].lower():
             ups = urlparse(res.headers['Location'])
             qdata = parse_qs(ups.query)
-            return self.authenticate_with_code(qdata['code'][0], params['redirect_uri'])
+            # Return code if requested, otherwise redeem it
+            if return_code:
+                return qdata['code'][0]
+            return coderedeemfunc(qdata['code'][0], params['redirect_uri'])
+        if res.status_code == 302 and 'sso_nonce' in res.headers['Location'].lower():
+            ups = urlparse(res.headers['Location'])
+            qdata = parse_qs(ups.query)
+            if 'sso_nonce' in qdata:
+                nonce = qdata['sso_nonce'][0]
+                print(f'Redirected with new nonce. Old nonce may be expired. New nonce: {nonce}')
         if self.debug:
             with open('roadtools.debug.html','w') as outfile:
                 outfile.write(str(res.headers))
                 outfile.write('------\n\n\n-----')
                 outfile.write(res.content.decode('utf-8'))
+
+        # Try to find SSO nonce in json config
+        startpos = res.content.find(b'$Config=')
+        stoppos = res.content.find(b'//]]></script>')
+        if startpos != -1 and stoppos != -1:
+            jsonbytes = res.content[startpos+8:stoppos-2]
+            try:
+                jdata = json.loads(jsonbytes)
+                try:
+                    error = jdata['strMainMessage']
+                    print(f'Error from STS: {error}')
+                    error = jdata['strAdditionalMessage']
+                    print(f'Additional info: {error}')
+                    error = jdata['strServiceExceptionMessage']
+                    print(f'Exception: {error}')
+                except KeyError:
+                    pass
+            except json.decoder.JSONDecodeError:
+                pass
         print('No authentication code was returned, make sure the PRT cookie is valid')
         print('It is also possible that the sign-in was blocked by Conditional Access policies')
         return False
@@ -546,6 +689,10 @@ class Authentication():
                                  action='store',
                                  help='Resource to authenticate to (Default: https://graph.windows.net)',
                                  default='https://graph.windows.net')
+        auth_parser.add_argument('-s',
+                                 '--scope',
+                                 action='store',
+                                 help='Scope to request when authenticating. Not supported in all flows yet. Overrides resource if specified')
         auth_parser.add_argument('--as-app',
                                  action='store_true',
                                  help='Authenticate as App (requires password and client ID set)')
@@ -557,7 +704,7 @@ class Authentication():
                                  help='Access token (JWT)')
         auth_parser.add_argument('--refresh-token',
                                  action='store',
-                                 help='Refresh token (JWT)')
+                                 help='Refresh token')
         auth_parser.add_argument('--prt-cookie',
                                  action='store',
                                  help='Primary Refresh Token cookie from ROADtoken (JWT)')
@@ -649,8 +796,11 @@ class Authentication():
         """
         tokenobject = {
             'tokenType': tokenreply['token_type'],
-            'expiresOn': datetime.datetime.fromtimestamp(int(tokenreply['expires_on'])).strftime('%Y-%m-%d %H:%M:%S')
         }
+        try:
+            tokenobject['expiresOn'] = datetime.datetime.fromtimestamp(int(tokenreply['expires_on'])).strftime('%Y-%m-%d %H:%M:%S')
+        except KeyError:
+            tokenobject['expiresOn'] = (datetime.datetime.now() + datetime.timedelta(seconds=int(tokenreply['expires_in']))).strftime('%Y-%m-%d %H:%M:%S')
         translate_map = {
             'access_token': 'accessToken',
             'refresh_token': 'refreshToken',
@@ -730,11 +880,16 @@ class Authentication():
         self.outfile = args.tokenfile
         self.debug = args.debug
         self.set_resource_uri(args.resource)
+        self.scope = args.scope
 
         if not self.username is None and self.password is None:
             self.password = getpass.getpass()
 
     def get_tokens(self, args):
+        """
+        Get tokens based on the arguments specified.
+        Expects args to be generated from get_sub_argparse
+        """
         if self.tokendata:
             return self.tokendata
         if self.refresh_token and not self.access_token:
@@ -743,7 +898,7 @@ class Authentication():
                     token_data = json.load(infile)
             else:
                 token_data = {'refreshToken': self.refresh_token}
-            return self.authenticate_with_refresh(token_data)
+            return self.authenticate_with_refresh_native(token_data['refreshToken'])
         if self.access_token and not self.refresh_token:
             self.tokendata, _ = self.parse_accesstoken(self.access_token)
             return self.tokendata
@@ -756,7 +911,7 @@ class Authentication():
         if args.prt_init:
             nonce = self.get_prt_cookie_nonce()
             if nonce:
-                print('Requested nonce from server to use with ROADtoken: %s' % nonce)
+                print(f'Requested nonce from server to use with ROADtoken: {nonce}')
             return False
         if args.prt_cookie:
             derived_key = self.ensure_binary_derivedkey(args.derived_key)

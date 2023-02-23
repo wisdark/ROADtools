@@ -39,6 +39,19 @@ def main():
     device_parser.add_argument('--device-type', action='store', help='Device OS type (default: Windows)')
     device_parser.add_argument('--os-version', action='store', help='Device OS version (default: 10.0.19041.928)')
 
+    # Construct hybrid device module
+    hdevice_parser = subparsers.add_parser('hybriddevice', help='Join an on-prem device to Azure AD')
+    hdevice_parser.add_argument('-c', '--cert-pem', action='store', metavar='file', help='Certificate file containing on-prem device cert')
+    hdevice_parser.add_argument('-k', '--key-pem', action='store', metavar='file', help='Private key file for device certificate')
+    hdevice_parser.add_argument('--cert-pfx', action='store', metavar='file', help='Device cert and key as PFX file')
+    hdevice_parser.add_argument('--pfx-pass', action='store', metavar='password', help='PFX file password')
+    hdevice_parser.add_argument('--pfx-base64', action='store', metavar='BASE64', help='PFX file as base64 string')
+    hdevice_parser.add_argument('-n', '--name', action='store', help='Device display name (default: DESKTOP-<RANDOM>)')
+    hdevice_parser.add_argument('--device-type', action='store', help='Device OS type (default: Windows)')
+    hdevice_parser.add_argument('--os-version', action='store', help='Device OS version (default: 10.0.19041.928)')
+    hdevice_parser.add_argument('--sid', action='store', required=True, help='Device SID in AD')
+    hdevice_parser.add_argument('-t', '--tenant', action='store', required=True, help='Tenant ID where device exists')
+
     # Construct PRT module
     prt_parser = subparsers.add_parser('prt', help='PRT request/renewal module')
     prt_parser.add_argument('-a',
@@ -258,6 +271,9 @@ def main():
     kdbauth_parser.add_argument('-k', '--keep-open',
                                 action='store_true',
                                 help='Do not close the browser window after timeout. Useful if you want to browse online apps with the obtained credentials')
+    kdbauth_parser.add_argument('--capture-code',
+                                action='store_true',
+                                help='Do not attempt to redeem any authentication code but print it instead')
 
     # Interactive auth using Selenium - inject PRT
     browserprtauth_parser = subparsers.add_parser('browserprtauth', help='Selenium based auth with automatic PRT usage. Emulates Edge browser with PRT')
@@ -286,6 +302,9 @@ def main():
     browserprtauth_parser.add_argument('--prt-sessionkey',
                                        action='store',
                                        help='Primary Refresh Token session key (as hex key)')
+    browserprtauth_parser.add_argument('--prt-cookie',
+                                       action='store',
+                                       help='Primary Refresh Token cookie from ROADtoken (JWT)')
     browserprtauth_parser.add_argument('--tokenfile',
                                        action='store',
                                        help='File to store the credentials (default: .roadtools_auth)',
@@ -417,6 +436,10 @@ def main():
             if not deviceauth.loadcert(args.cert_pem, args.key_pem):
                 return
             deviceauth.delete_device(args.cert_pem, args.key_pem)
+    elif args.command == 'hybriddevice':
+        if not deviceauth.loadcert(args.cert_pem, args.key_pem, args.cert_pfx, args.pfx_pass, args.pfx_base64):
+            return
+        deviceauth.register_hybrid_device(args.sid, args.tenant, certout=args.cert_pem, privout=args.key_pem, device_type=args.device_type, device_name=args.name, os_version=args.os_version)
     elif args.command == 'prt':
         if args.action == 'request':
             if not deviceauth.loadcert(args.cert_pem, args.key_pem, args.cert_pfx, args.pfx_pass, args.pfx_base64):
@@ -457,12 +480,16 @@ def main():
             return
         tokendata = deviceauth.aad_brokerplugin_prt_auth(args.client, args.resource, redirect_uri=args.redirect_url)
         # We need to convert this to a token format roadlib understands
-        tokenobject, _ = auth.parse_accesstoken(tokendata['access_token'])
-        tokenobject['expiresIn'] = tokendata['expires_in']
-        tokenobject['refreshToken'] = tokendata['refresh_token']
-        auth.outfile = args.tokenfile
-        auth.tokendata = tokenobject
-        auth.save_tokens(args)
+        if 'access_token' in tokendata:
+            tokenobject, _ = auth.parse_accesstoken(tokendata['access_token'])
+            tokenobject['expiresIn'] = tokendata['expires_in']
+            tokenobject['refreshToken'] = tokendata['refresh_token']
+            auth.outfile = args.tokenfile
+            auth.tokendata = tokenobject
+            auth.save_tokens(args)
+        else:
+            print('No access token in token data, assuming custom request')
+            print(tokendata)
     elif args.command == 'decrypt':
         header, enc_key, iv, ciphertext, auth_tag = auth.parse_compact_jwe(args.data, args.verbose)
         if header['alg'] == 'RSA-OAEP':
@@ -497,7 +524,7 @@ def main():
     elif args.command == 'codeauth':
         auth.set_client_id(args.client)
         auth.set_resource_uri(args.resource)
-        auth.authenticate_with_code_native(args.code, args.redirect_url)
+        auth.authenticate_with_code_native(args.code, args.redirect_url, client_secret=args.password)
         auth.outfile = args.tokenfile
         auth.save_tokens(args)
     elif args.command == 'listaliases':
@@ -538,7 +565,9 @@ def main():
         if not service:
             return
         selauth.driver = selauth.get_webdriver(service)
-        selauth.selenium_login(url, args.username, password, otpseed, keep=args.keep_open)
+        selauth.selenium_login(url, args.username, password, otpseed, keep=args.keep_open, capture=args.capture_code)
+        if args.capture_code:
+            return
         auth.outfile = args.tokenfile
         auth.save_tokens(args)
     elif args.command == 'browserprtauth':
@@ -546,6 +575,8 @@ def main():
         auth.set_resource_uri(args.resource)
         if args.prt and args.prt_sessionkey:
             deviceauth.setprt(args.prt, args.prt_sessionkey)
+        elif args.prt_cookie:
+            pass
         elif args.prt_file and deviceauth.loadprt(args.prt_file):
             pass
         else:
@@ -560,7 +591,7 @@ def main():
         if not service:
             return
         selauth.driver = selauth.get_webdriver(service, intercept=True)
-        if not selauth.selenium_login_with_prt(url, keep=args.keep_open):
+        if not selauth.selenium_login_with_prt(url, keep=args.keep_open, prtcookie=args.prt_cookie):
             return
         auth.outfile = args.tokenfile
         auth.save_tokens(args)

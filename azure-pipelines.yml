@@ -51,6 +51,7 @@ jobs:
     workingDirectory: roadtx
 
   - script: |
+      set -e
       roadrecon -h
       roadrecon-gui -h
       roadrecon plugin bloodhound -h
@@ -66,6 +67,7 @@ jobs:
       rtpass: $(rtpass)
 
   - script: |
+      set -e
       roadtx -h
       roadtx gettokens -u $rtuser -p $rtpass
       roadtx gettokens -u $rtuser -p $rtpass -c azcli -r azrm
@@ -77,12 +79,17 @@ jobs:
       rtpass: $(rtpass)
 
   - script: |
+      set -e
       roadtx gettokens -u $rtuser -p $rtpass -r drs
       roadtx device -a join -c pipeline.pem -k pipeline.key
-      roadtx prt -a request -c pipeline.pem -k pipeline.key -u $rtuser -p $rtpass >/dev/null
-      roadtx prtauth
-      roadtx prt -a renew >/dev/null
-      roadtx prtauth -c azcli -r azrm
+      retry_if_fail()
+      {
+          for i in 1 2 3 4 5; do "$@" && break || sleep 10s; done
+      }
+      retry_if_fail roadtx prt -a request -c pipeline.pem -k pipeline.key -u $rtuser -p $rtpass >/dev/null
+      retry_if_fail roadtx prtauth
+      retry_if_fail roadtx prt -a renew >/dev/null
+      retry_if_fail roadtx prtauth -c azcli -r azrm
       roadtx device -a delete -c pipeline.pem -k pipeline.key
       rm .roadtools_auth pipeline.pem pipeline.key
     displayName: 'Run roadtx device tests'
@@ -113,7 +120,7 @@ jobs:
     inputs:
       command: 'custom'
       workingDir: 'roadrecon/frontend/'
-      customCommand: 'run build -- --prod'
+      customCommand: 'run build -- --configuration production'
 
   - script: |
       pip install --upgrade setuptools wheel
