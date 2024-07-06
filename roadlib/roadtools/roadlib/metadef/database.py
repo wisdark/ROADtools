@@ -3,14 +3,14 @@ import json
 import datetime
 import sqlalchemy.types
 from sqlalchemy import Column, Text, Boolean, BigInteger as Integer, create_engine, Table, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker, foreign
+from sqlalchemy.orm import relationship, sessionmaker, foreign, declarative_base
 from sqlalchemy.types import TypeDecorator, TEXT
 Base = declarative_base()
 
 
 class JSON(TypeDecorator):
     impl = TEXT
+    cache_ok = True
     def process_bind_param(self, value, dialect):
         if value is not None:
             value = json.dumps(value)
@@ -142,6 +142,21 @@ lnk_group_owner_serviceprincipal = Table('lnk_group_owner_serviceprincipal', Bas
     Column('ServicePrincipal', Text, ForeignKey('ServicePrincipals.objectId'))
 )
 
+lnk_au_member_user = Table('lnk_au_member_user', Base.metadata,
+    Column('AdministrativeUnit', Text, ForeignKey('AdministrativeUnits.objectId')),
+    Column('User', Text, ForeignKey('Users.objectId'))
+)
+
+lnk_au_member_group = Table('lnk_au_member_group', Base.metadata,
+    Column('AdministrativeUnit', Text, ForeignKey('AdministrativeUnits.objectId')),
+    Column('Group', Text, ForeignKey('Groups.objectId'))
+)
+
+lnk_au_member_device = Table('lnk_au_member_device', Base.metadata,
+    Column('AdministrativeUnit', Text, ForeignKey('AdministrativeUnits.objectId')),
+    Column('Device', Text, ForeignKey('Devices.objectId'))
+)
+
 class AppRoleAssignment(Base, SerializeMixin):
     __tablename__ = "AppRoleAssignments"
     objectType = Column(Text)
@@ -247,10 +262,12 @@ class User(Base, SerializeMixin):
     msExchMailboxGuid = Column(Text)
     netId = Column(Text)
     onPremisesDistinguishedName = Column(Text)
+    onPremisesObjectIdentifier = Column(Text)
     onPremisesPasswordChangeTimestamp = Column(DateTime)
     onPremisesSecurityIdentifier = Column(Text)
     onPremisesUserPrincipalName = Column(Text)
     otherMails = Column(JSON)
+    originTenantInfo = Column(JSON)
     passwordPolicies = Column(Text)
     passwordProfile = Column(JSON)
     physicalDeliveryOfficeName = Column(Text)
@@ -312,6 +329,10 @@ class User(Base, SerializeMixin):
     ownedGroups = relationship("Group",
         secondary=lnk_group_owner_user,
         back_populates="ownerUsers")
+
+    memberOfAu = relationship("AdministrativeUnit",
+        secondary=lnk_au_member_user,
+        back_populates="memberUsers")
 
 
 class ServicePrincipal(Base, SerializeMixin):
@@ -488,6 +509,10 @@ class Group(Base, SerializeMixin):
         secondary=lnk_role_member_group,
         back_populates="memberGroups")
 
+    memberOfAu = relationship("AdministrativeUnit",
+        secondary=lnk_au_member_group,
+        back_populates="memberGroups")
+
 
 class Application(Base, SerializeMixin):
     __tablename__ = "Applications"
@@ -604,6 +629,10 @@ class Device(Base, SerializeMixin):
         secondary=lnk_group_member_device,
         back_populates="memberDevices")
 
+    memberOfAu = relationship("AdministrativeUnit",
+        secondary=lnk_au_member_device,
+        back_populates="memberDevices")
+
 
 class DirectoryRole(Base, SerializeMixin):
     __tablename__ = "DirectoryRoles"
@@ -675,6 +704,7 @@ class ApplicationRef(Base, SerializeMixin):
     appId = Column(Text, primary_key=True)
     appRoles = Column(JSON)
     availableToOtherTenants = Column(Boolean)
+    certification = Column(JSON)
     displayName = Column(Text)
     errorUrl = Column(Text)
     homepage = Column(Text)
@@ -732,6 +762,7 @@ class Contact(Base, SerializeMixin):
     mail = Column(Text)
     mailNickname = Column(Text)
     mobile = Column(Text)
+    onPremisesObjectIdentifier = Column(Text)
     physicalDeliveryOfficeName = Column(Text)
     postalCode = Column(Text)
     provisioningErrors = Column(JSON)
@@ -773,6 +804,11 @@ class RoleDefinition(Base, SerializeMixin):
     rolePermissions = Column(JSON)
     templateId = Column(Text)
     version = Column(Text)
+    eligibleAssignments = relationship("EligibleRoleAssignment",
+        back_populates="roleDefinition")
+
+    assignments = relationship("RoleAssignment",
+        back_populates="roleDefinition")
 
 
 class RoleAssignment(Base, SerializeMixin):
@@ -780,7 +816,19 @@ class RoleAssignment(Base, SerializeMixin):
     id = Column(Text, primary_key=True)
     principalId = Column(Text)
     resourceScopes = Column(JSON)
-    roleDefinitionId = Column(Text)
+    roleDefinitionId = Column(Text, ForeignKey("RoleDefinitions.objectId"))
+    roleDefinition = relationship("RoleDefinition",
+        back_populates="assignments")
+
+
+class EligibleRoleAssignment(Base, SerializeMixin):
+    __tablename__ = "EligibleRoleAssignments"
+    id = Column(Text, primary_key=True)
+    principalId = Column(Text)
+    resourceScopes = Column(JSON)
+    roleDefinitionId = Column(Text, ForeignKey("RoleDefinitions.objectId"))
+    roleDefinition = relationship("RoleDefinition",
+        back_populates="eligibleAssignments")
 
 
 class AuthorizationPolicy(Base, SerializeMixin):
@@ -805,6 +853,31 @@ class DirectorySetting(Base, SerializeMixin):
     displayName = Column(Text)
     templateId = Column(Text)
     values = Column(JSON)
+
+
+class AdministrativeUnit(Base, SerializeMixin):
+    __tablename__ = "AdministrativeUnits"
+    objectType = Column(Text)
+    objectId = Column(Text, primary_key=True)
+    deletionTimestamp = Column(DateTime)
+    displayName = Column(Text)
+    description = Column(Text)
+    isMemberManagementRestricted = Column(Boolean)
+    membershipRule = Column(Text)
+    membershipRuleProcessingState = Column(Text)
+    membershipType = Column(Text)
+    visibility = Column(Text)
+    memberGroups = relationship("Group",
+        secondary=lnk_au_member_group,
+        back_populates="memberOfAu")
+
+    memberUsers = relationship("User",
+        secondary=lnk_au_member_user,
+        back_populates="memberOfAu")
+
+    memberDevices = relationship("Device",
+        secondary=lnk_au_member_device,
+        back_populates="memberOfAu")
 
 
 def parse_db_argument(dbarg):

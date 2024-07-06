@@ -1,7 +1,11 @@
-from roadtools.roadrecon.server import create_app_test
+from roadtools.roadrecon.server import create_app_test, db
+from sqlalchemy import func
+from roadtools.roadlib.metadef.database import Policy
+from flask_sqlalchemy import SQLAlchemy
+
 import pytest
 
-@pytest.fixture
+@pytest.fixture(scope='module')
 def app():
     app = create_app_test()
     return app

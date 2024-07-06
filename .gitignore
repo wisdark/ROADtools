@@ -10,6 +10,7 @@ Pipfile
 __pycache__
 *.json
 *.pem
+*.crt
 *.key
 *.pfx
 *.prt
@@ -17,3 +18,6 @@ __pycache__
 geckodriver
 *.log
 .env
+# Include roadtx data file
+!roadtx/roadtools/roadtx/*.json
+roadlib/roadtools/roadlib/*.xml

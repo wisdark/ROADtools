@@ -125,6 +125,8 @@ class CompliantApplication(object):
     props = {
         'mamEnrollmentId': Edm.Guid,
         'expirationTime': Edm.DateTime,
+        'applicationId': Edm.Guid,
+        'userId': Edm.Guid,
     }
 
 
@@ -229,6 +231,7 @@ class LicenseUnitsDetail(object):
         'enabled': Edm.Int32,
         'suspended': Edm.Int32,
         'warning': Edm.Int32,
+        'lockedOut': Edm.Int32,
     }
 
 
@@ -505,6 +508,7 @@ class TrustedCertificateSubject(object):
     props = {
         'authorityId': Edm.Guid,
         'subjectName': Edm.String,
+        'revokedCertificateIdentifiers': Collection,
     }
 
 
@@ -575,6 +579,12 @@ class VerifiedPublisher(object):
         'displayName': Edm.String,
         'verifiedPublisherId': Edm.String,
         'addedDateTime': Edm.DateTime,
+    }
+
+
+class CrossTenantSynchronizationInfo(object):
+    props = {
+        'creationType': Edm.String,
     }
 
 
@@ -671,5 +681,13 @@ class ResourceAuthorizationDecision(object):
     props = {
         'resourceScope': Edm.String,
         'authorizationDecisions': Collection,
+    }
+
+
+class CrossTenantSynchronizationResource(object):
+    props = {
+        'originTenantId': Edm.String,
+        'originId': Edm.String,
+        'synchronizationInfo': CrossTenantSynchronizationInfo,
     }
 

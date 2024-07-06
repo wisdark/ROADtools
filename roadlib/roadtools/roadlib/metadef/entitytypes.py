@@ -51,6 +51,7 @@ class AdministrativeUnit(DirectoryObject):
     props = {
         'displayName': Edm.String,
         'description': Edm.String,
+        'isMemberManagementRestricted': Edm.Boolean,
         'membershipRule': Edm.String,
         'membershipRuleProcessingState': Edm.String,
         'membershipType': Edm.String,
@@ -124,6 +125,7 @@ class ApplicationRef(object):
         'appId': Edm.String,
         'appRoles': Collection,
         'availableToOtherTenants': Edm.Boolean,
+        'certification': Certification,
         'displayName': Edm.String,
         'errorUrl': Edm.String,
         'homepage': Edm.String,
@@ -246,6 +248,7 @@ class Contact(DirectoryObject):
         'mail': Edm.String,
         'mailNickname': Edm.String,
         'mobile': Edm.String,
+        'onPremisesObjectIdentifier': Edm.String,
         'physicalDeliveryOfficeName': Edm.String,
         'postalCode': Edm.String,
         'provisioningErrors': Collection,
@@ -769,17 +772,20 @@ class StubDirectoryObject(DirectoryObject):
 
 class SubscribedSku(object):
     props = {
+        'accountName': Edm.String,
+        'accountId': Edm.Guid,
+        'appliesTo': Edm.String,
         'capabilityStatus': Edm.String,
         'consumedUnits': Edm.Int32,
         'objectId': Edm.String,
-        'prepaidUnits': LicenseUnitsDetail,
         'overageUnits': LicenseUnitsDetail,
-        'trialUnits': LicenseUnitsDetail,
+        'prepaidUnits': LicenseUnitsDetail,
         'selfServiceSignupUnits': LicenseUnitsDetail,
         'servicePlans': Collection,
         'skuId': Edm.Guid,
         'skuPartNumber': Edm.String,
-        'appliesTo': Edm.String,
+        'subscriptionIds': Collection,
+        'trialUnits': LicenseUnitsDetail,
     }
     rels = [
 
@@ -923,10 +929,12 @@ class User(DirectoryObject):
         'msExchMailboxGuid': Edm.Guid,
         'netId': Edm.String,
         'onPremisesDistinguishedName': Edm.String,
+        'onPremisesObjectIdentifier': Edm.String,
         'onPremisesPasswordChangeTimestamp': Edm.DateTime,
         'onPremisesSecurityIdentifier': Edm.String,
         'onPremisesUserPrincipalName': Edm.String,
         'otherMails': Collection,
+        'originTenantInfo': CrossTenantSynchronizationResource,
         'passwordPolicies': Edm.String,
         'passwordProfile': PasswordProfile,
         'physicalDeliveryOfficeName': Edm.String,

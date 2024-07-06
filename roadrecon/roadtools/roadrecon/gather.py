@@ -1,22 +1,31 @@
-import warnings
+import argparse
+import asyncio
 import json
 import os
-import asyncio
-import time
-import argparse
 import sys
+import time
 import traceback
-import requests
+import warnings
+
 import aiohttp
-from sqlalchemy.dialects.postgresql import insert as pginsert
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import func, bindparam
-from roadtools.roadlib.metadef.database import User, ServicePrincipal, Application, Group, Device, DirectoryRole, RoleAssignment, ExtensionProperty, Contact, OAuth2PermissionGrant, Policy, RoleDefinition, AppRoleAssignment, TenantDetail, AuthorizationPolicy, DirectorySetting
-from roadtools.roadlib.metadef.database import lnk_group_member_user, lnk_group_member_group, lnk_group_member_contact, lnk_group_member_device, lnk_group_member_serviceprincipal, lnk_device_owner, lnk_group_owner_user, lnk_group_owner_serviceprincipal
+import requests
+import roadtools.roadlib.metadef.database as database
 #from roadlib.metadef.database import Domain
 from roadtools.roadlib.auth import Authentication
-from roadtools.roadlib.metadef.database import ApplicationRef
-import roadtools.roadlib.metadef.database as database
+from roadtools.roadlib.metadef.database import (
+    AdministrativeUnit, Application, ApplicationRef, AppRoleAssignment,
+    AuthorizationPolicy, Contact, Device, DirectoryRole, DirectorySetting,
+    EligibleRoleAssignment, ExtensionProperty, Group, OAuth2PermissionGrant,
+    Policy, RoleAssignment, RoleDefinition, ServicePrincipal, TenantDetail,
+    User, lnk_au_member_device, lnk_au_member_group, lnk_au_member_user,
+    lnk_device_owner, lnk_group_member_contact, lnk_group_member_device,
+    lnk_group_member_group, lnk_group_member_serviceprincipal,
+    lnk_group_member_user, lnk_group_owner_serviceprincipal,
+    lnk_group_owner_user)
+from sqlalchemy import bindparam, func, text
+from sqlalchemy.dialects.postgresql import insert as pginsert
+from sqlalchemy.orm import sessionmaker
+
 warnings.simplefilter('ignore')
 token = None
 expiretime = None
@@ -59,6 +68,9 @@ async def dumphelper(url, method=requests.get):
                         print('Sleeping because of rate-limit hit')
                     continue
                 if req.status != 200:
+                    # Ignore default users role not being found
+                    if req.status == 404 and 'a0b1b346-4d3e-4e8b-98f8-753987be4970' in url:
+                        return
                     print('Error %d for URL %s' % (req.status, nexturl))
                     # print(await req.text())
                     # print(req.headers)
@@ -104,9 +116,14 @@ def checktoken():
     global token, expiretime
     if time.time() > expiretime - 300:
         auth = Authentication()
-        auth.client_id = token['_clientId']
+        try:
+            auth.client_id = token['_clientId']
+        except KeyError:
+            auth.client_id = '1b730954-1685-4b74-9bfd-dac224a7b894'
         auth.tenant = token['tenantId']
         auth.tokendata = token
+        if 'useragent' in token:
+            auth.set_user_agent(token['useragent'])
         if 'refreshToken' in token:
             token = auth.authenticate_with_refresh(token)
             headers['Authorization'] = '%s %s' % (token['tokenType'], token['accessToken'])
@@ -135,6 +152,9 @@ async def dumpsingle(url, method):
                 # This can happen
                 if res.status == 404 and 'applicationRefs' in url:
                     return
+                # Ignore default users role not being found
+                if res.status == 404 and 'a0b1b346-4d3e-4e8b-98f8-753987be4970' in url:
+                    return
                 print('Error %d for URL %s' % (res.status, url))
                 return
             objects = await res.json()
@@ -143,7 +163,7 @@ async def dumpsingle(url, method):
         print(exc)
         return
 
-def commit(engine, dbtype, cache, ignore=False):
+def enginecommit(engine, dbtype, cache, ignore=False):
     global dburl
     if 'postgresql' in dburl and ignore:
         insertst = pginsert(dbtype.__table__)
@@ -151,15 +171,32 @@ def commit(engine, dbtype, cache, ignore=False):
             index_elements=['objectId']
         )
     elif 'sqlite' in dburl and ignore:
-        statement = dbtype.__table__.insert(prefixes=['OR IGNORE'])
+        statement = dbtype.__table__.insert().prefix_with('OR IGNORE')
     else:
         statement = dbtype.__table__.insert()
-    engine.execute(
+    with engine.begin() as conn:
+        conn.execute(
+            statement,
+            cache
+        )
+
+def commit(session, dbtype, cache, ignore=False):
+    global dburl
+    if 'postgresql' in dburl and ignore:
+        insertst = pginsert(dbtype.__table__)
+        statement = insertst.on_conflict_do_nothing(
+            index_elements=['objectId']
+        )
+    elif 'sqlite' in dburl and ignore:
+        statement = dbtype.__table__.insert().prefix_with('OR IGNORE')
+    else:
+        statement = dbtype.__table__.insert()
+    session.execute(
         statement,
         cache
     )
 
-def commitlink(engine, cachedict, ignore=False):
+def commitlink(session, cachedict, ignore=False):
     global dburl
     for linktable, cache in cachedict.items():
         if 'postgresql' in dburl and ignore:
@@ -168,18 +205,18 @@ def commitlink(engine, cachedict, ignore=False):
                 index_elements=['objectId']
             )
         elif 'sqlite' in dburl and ignore:
-            statement = linktable.insert(prefixes=['OR IGNORE'])
+            statement = linktable.insert().prefix_with('OR IGNORE')
         else:
             statement = linktable.insert()
         # print(cache)
-        engine.execute(
+        session.execute(
             statement,
             cache
         )
 
-def commitmfa(engine, dbtype, cache):
+def commitmfa(session, dbtype, cache):
     statement = dbtype.__table__.update().where(dbtype.objectId == bindparam('userid'))
-    engine.execute(
+    session.execute(
         statement,
         cache
     )
@@ -207,10 +244,10 @@ class DataDumper(object):
         async for obj in dumphelper(url, method=method):
             cache.append(obj)
             if len(cache) > 1000:
-                commit(self.engine, dbtype, cache)
+                enginecommit(self.engine, dbtype, cache)
                 del cache[:]
         if len(cache) > 0:
-            commit(self.engine, dbtype, cache)
+            enginecommit(self.engine, dbtype, cache)
 
     async def dump_l_to_db(self, url, method, mapping, linkname, childtbl, parent):
         global groupcounter, totalgroups, devicecounter, totaldevices
@@ -224,7 +261,7 @@ class DataDumper(object):
                 except KeyError:
                     print('Unsupported member type: %s for parent %s' % (objclass, parent.__table__))
                     continue
-            child = self.session.query(childtbl).get(objectid)
+            child = self.session.get(childtbl, objectid)
             if not child:
                 try:
                     parentname = parent.displayName
@@ -376,7 +413,7 @@ class DataDumper(object):
         i = 0
         async for obj in dumphelper(url, method=method):
             if len(obj[expandprop]) > 0:
-                parent = self.session.query(dbtype).get(obj['objectId'])
+                parent = self.session.get(dbtype, obj['objectId'])
                 if not parent:
                     print('Non-existing parent found during expansion %s %s: %s' % (dbtype.__table__, expandprop, obj['objectId']))
                     continue
@@ -388,7 +425,7 @@ class DataDumper(object):
                         except KeyError:
                             print('Unsupported member type: %s' % objclass)
                             continue
-                    child = self.session.query(childtbl).get(epdata['objectId'])
+                    child = self.session.get(childtbl, epdata['objectId'])
                     if not child:
                         print('Non-existing child during expansion %s %s: %s' % (dbtype.__table__, expandprop, epdata['objectId']))
                         continue
@@ -448,6 +485,18 @@ class DataDumper(object):
             commit(self.session, dbtype, cache)
         self.session.commit()
 
+    async def dump_eligible_role_members(self, dbtype):
+        parents = self.session.query(RoleDefinition).all()
+        cache = []
+        jobs = []
+        for parent in parents:
+            url = 'https://graph.windows.net/%s/eligibleRoleAssignments?api-version=%s&$filter=roleDefinitionId eq \'%s\'' % (self.tenantid, self.api_version, parent.objectId)
+            jobs.append(self.dump_lo_to_db(url, self.ahsession.get, dbtype, cache))
+        await asyncio.gather(*jobs)
+        if len(cache) > 0:
+            commit(self.session, dbtype, cache)
+        self.session.commit()
+
 async def run(args):
     global token, expiretime, headers, totalgroups, totaldevices, dburl
     if 'tenantId' in token:
@@ -460,6 +509,14 @@ async def run(args):
     headers = {
         'Authorization': '%s %s' % (token['tokenType'], token['accessToken'])
     }
+    if args.user_agent:
+        # Alias support, get temp auth object
+        auth = Authentication()
+        auth.set_user_agent(args.user_agent)
+        headers['User-Agent'] = auth.user_agent
+        # Store this in the token as well
+        token['useragent'] = auth.user_agent
+
     if not checktoken():
         return
     # Recreate DB
@@ -481,6 +538,7 @@ async def run(args):
             tasks.append(dumper.dump_object('policies', Policy))
             tasks.append(dumper.dump_object('servicePrincipals', ServicePrincipal))
             tasks.append(dumper.dump_object('groups', Group))
+            tasks.append(dumper.dump_object('administrativeUnits', AdministrativeUnit))
 
             tasks.append(dumper.dump_object('applications', Application))
             tasks.append(dumper.dump_object('devices', Device))
@@ -502,9 +560,10 @@ async def run(args):
         # Delete existing links to make sure we start with clean data
         for table in database.Base.metadata.tables.keys():
             if table.startswith('lnk_'):
-                dbsession.execute("DELETE FROM {0}".format(table))
+                dbsession.execute(text("DELETE FROM {0}".format(table)))
         dbsession.query(ApplicationRef).delete()
         dbsession.query(RoleAssignment).delete()
+        dbsession.query(EligibleRoleAssignment).delete()
         dbsession.commit()
 
     # Mapping object, mapping type returned to Table and link name
@@ -523,6 +582,11 @@ async def run(args):
         'Microsoft.DirectoryServices.User': (User, 'ownerUsers'),
         'Microsoft.DirectoryServices.ServicePrincipal': (ServicePrincipal, 'ownerServicePrincipals'),
     }
+    au_mapping = {
+        'Microsoft.DirectoryServices.User': (User, 'memberUsers'),
+        'Microsoft.DirectoryServices.Group': (Group, 'memberGroups'),
+        'Microsoft.DirectoryServices.Device': (Device, 'memberDevices'),
+    }
     role_mapping = {
         'Microsoft.DirectoryServices.User': (User, 'memberUsers'),
         'Microsoft.DirectoryServices.ServicePrincipal': (ServicePrincipal, 'memberServicePrincipals'),
@@ -536,6 +600,11 @@ async def run(args):
         'Microsoft.DirectoryServices.Device': (lnk_group_member_device, 'Group', 'Device'),
         'Microsoft.DirectoryServices.ServicePrincipal': (lnk_group_member_serviceprincipal, 'Group', 'ServicePrincipal'),
     }
+    au_link_mapping = {
+        'Microsoft.DirectoryServices.User': (lnk_au_member_user, 'AdministrativeUnit', 'User'),
+        'Microsoft.DirectoryServices.Group': (lnk_au_member_group, 'AdministrativeUnit', 'Group'),
+        'Microsoft.DirectoryServices.Device': (lnk_au_member_device, 'AdministrativeUnit', 'Device'),
+    }
     group_owner_link_mapping = {
         'Microsoft.DirectoryServices.User': (lnk_group_owner_user, 'Group', 'User'),
         'Microsoft.DirectoryServices.ServicePrincipal': (lnk_group_owner_serviceprincipal, 'Group', 'ServicePrincipal'),
@@ -546,6 +615,7 @@ async def run(args):
 
     tasks = []
     dumper.session = dbsession
+    # pylint: disable=not-callable
     totalgroups = dbsession.query(func.count(Group.objectId)).scalar()
     totaldevices = dbsession.query(func.count(Device.objectId)).scalar()
     if totalgroups > MAX_GROUPS:
@@ -560,6 +630,7 @@ async def run(args):
         if totalgroups <= MAX_GROUPS:
             tasks.append(dumper.dump_links('groups', 'members', Group, mapping=group_mapping))
             tasks.append(dumper.dump_links('groups', 'owners', Group, mapping=group_owner_mapping))
+            tasks.append(dumper.dump_links('administrativeUnits', 'members', AdministrativeUnit, mapping=au_mapping))
             tasks.append(dumper.dump_object_expansion('devices', Device, 'registeredOwners', 'owner', User))
         tasks.append(dumper.dump_links('directoryRoles', 'members', DirectoryRole, mapping=role_mapping))
         tasks.append(dumper.dump_linked_objects('servicePrincipals', 'appRoleAssignedTo', ServicePrincipal, AppRoleAssignment, ignore_duplicates=True))
@@ -567,6 +638,7 @@ async def run(args):
         tasks.append(dumper.dump_object_expansion('servicePrincipals', ServicePrincipal, 'owners', 'owner', User, mapping=owner_mapping))
         tasks.append(dumper.dump_object_expansion('applications', Application, 'owners', 'owner', User, mapping=owner_mapping))
         tasks.append(dumper.dump_custom_role_members(RoleAssignment))
+        tasks.append(dumper.dump_eligible_role_members(EligibleRoleAssignment))
         if args.mfa:
             tasks.append(dumper.dump_mfa('users', User, method=ahsession.get))
         tasks.append(dumper.dump_each(ServicePrincipal, 'applicationRefs', ApplicationRef))
@@ -589,6 +661,7 @@ async def run(args):
             tasks.append(dumper.dump_links_with_queue(queue, 'devices', 'registeredOwners', Device, mapping=device_link_mapping))
             tasks.append(dumper.dump_links_with_queue(queue, 'groups', 'members', Group, mapping=group_link_mapping))
             tasks.append(dumper.dump_links_with_queue(queue, 'groups', 'owners', Group, mapping=group_owner_link_mapping))
+            tasks.append(dumper.dump_links_with_queue(queue, 'administrativeUnits', 'members', AdministrativeUnit, mapping=au_link_mapping))
 
             await asyncio.gather(*tasks)
             await queue.join()
@@ -622,6 +695,8 @@ def getargs(gather_parser):
                                '--tenant',
                                action='store',
                                help='Tenant ID to gather, if this info is not stored in the token')
+    gather_parser.add_argument('-ua', '--user-agent', action='store',
+                                help='Custom user agent to use. By default aiohttp default user agent is used, and python-requests is used for token renewal')
 
 def main(args=None):
     global token, headers, dburl, urlcounter

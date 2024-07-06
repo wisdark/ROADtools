@@ -30,6 +30,8 @@ import os
 import codecs
 import argparse
 import pprint
+import base64
+import zlib
 from html import escape
 from roadtools.roadlib.metadef.database import ServicePrincipal, User, Policy, Application, Group, DirectoryRole
 import roadtools.roadlib.metadef.database as database
@@ -114,7 +116,7 @@ class AccessPoliciesPlugin():
         else:
             res = self.session.query(Application).filter(Application.appId == aid).first()
             # if no result, query the ServicePrincipals
-            if len(res) == 0:
+            if res is None or len(res) == 0:
                 return self.session.query(ServicePrincipal).filter(ServicePrincipal.appId == aid).first()
 
     def _get_user(self, uid):
@@ -228,10 +230,11 @@ class AccessPoliciesPlugin():
                 if 'Office365' in clist:
                     ot += 'All Office 365 applications'
                 objects = self._get_application(clist)
-                if len(objects) > 0:
-                    if ctype == 'Applications':
-                        ot += 'Applications: '
-                        ot += ', '.join([escape(uobj.displayName) for uobj in objects])
+                if objects is not None: 
+                    if len(objects) > 0:
+                        if ctype == 'Applications':
+                            ot += 'Applications: '
+                            ot += ', '.join([escape(uobj.displayName) for uobj in objects])
         return ot
 
     def _parse_platform(self, cond):
@@ -310,6 +313,23 @@ class AccessPoliciesPlugin():
                 ot += self._parse_locationcrit(icrit)
         return ot
 
+    def _parse_signinrisks(self, cond):
+        try:
+            srcond = cond['SignInRisks']
+        except KeyError:
+            return ''
+
+        ot = '<strong>Including</strong>: '
+        for icrit in srcond['Include']:
+            ot += ', '.join([escape(crit) for crit in icrit['SignInRisks']])
+
+        if 'Exclude' in srcond:
+            ot += '\n<br /><strong>Excluding</strong>: '
+            for icrit in srcond['Exclude']:
+                ot += ', '.join([escape(crit) for crit in icrit['SignInRisks']])
+
+        return ot
+
     def _parse_locationcrit(self, crit):
         ot = ''
         for ctype, clist in crit.items():
@@ -383,6 +403,43 @@ class AccessPoliciesPlugin():
                 ot += self._parse_appcrit(icrit)
         return ot
 
+    def _parse_authflows(self, cond):
+        if not 'AuthFlows' in cond:
+            return ''
+        ucond = cond['AuthFlows']
+        ot = '<strong>Flows included</strong>: '
+
+        for icrit in ucond['Include']:
+            for _, clist in icrit.items():
+                ot += escape(', '.join(clist))
+        return ot
+
+    def _parse_associated_polcies(self,location_object,is_trusted_location,condition_policy_list):
+        found_pols = []
+
+        for pol in condition_policy_list:
+            if not pol.policyDetail:
+                continue
+            parsed = json.loads(pol.policyDetail[0])
+            if not parsed.get('Conditions') or not parsed.get('Conditions').get('Locations'):
+                continue
+
+            cloc = parsed.get('Conditions').get('Locations')
+            incl = cloc.get('Include') or []
+            excl = cloc.get('Exclude') or []
+            for i in incl:
+                if location_object in i.get('Locations') or (is_trusted_location and "AllTrusted" in i.get('Locations')):
+                    found_pols.append(escape(pol.displayName))
+
+            for i in excl:
+                if location_object in i.get('Locations') or (is_trusted_location and "AllTrusted" in i.get('Locations')):
+                    found_pols.append(escape(pol.displayName))
+
+
+
+        return found_pols
+
+
     def _parse_controls(self, controls):
         acontrols = []
         for c in controls:
@@ -407,14 +464,18 @@ class AccessPoliciesPlugin():
         ot = '<strong>Including</strong>: '
 
         for icrit in ucond['Include']:
-            ot += ', '.join([escape(crit) for crit in icrit['ClientTypes']])
+            ot += ', '.join(list({escape(self._translate_clienttype(crit)) for crit in icrit['ClientTypes']}))
 
-        if 'Exclude' in ucond:
-            ot += '\n<br /><strong>Excluding</strong>: '
-
-            for icrit in ucond['Exclude']:
-                ot += ', '.join([escape(crit) for crit in icrit['ClientTypes']])
         return ot
+
+    def _translate_clienttype(self, client):
+        if client in ['EasSupported', 'EasUnsupported']:
+            return 'Exchange ActiveSync'
+        if client in ['OtherLegacy', 'LegacySmtp', 'LegacyPop', 'LegacyImap', 'LegacyMapi', 'LegacyOffice']:
+            return 'Legacy Clients'
+        if client == 'Native':
+            return 'Mobile and Desktop clients'
+        return client
 
     def _parse_sessioncontrols(self, cond):
         if not 'SessionControls' in cond:
@@ -422,11 +483,24 @@ class AccessPoliciesPlugin():
         ucond = cond['SessionControls']
         return ', '.join(ucond)
 
+
+    def _parse_compressed_cidr(self,detail):
+        if not 'CompressedCidrIpRanges' in detail:
+            return ''
+        compressed = detail['CompressedCidrIpRanges']
+        b = base64.b64decode(compressed)
+        cstr = zlib.decompress(b, -zlib.MAX_WBITS)
+        decoded_cidrs = escape(cstr.decode()).split(",")
+        return decoded_cidrs
+
+
     def main(self, should_print=False):
         pp = pprint.PrettyPrinter(indent=4)
         ol = []
-        html = '<table>'
-        for policy in self.session.query(Policy).filter(Policy.policyType == 18):
+        oloc = []
+        html = '<h1>Policies</h1><table>'
+        condition_policy_list = self.session.query(Policy).filter(Policy.policyType == 18)
+        for policy in self.session.query(Policy).filter(Policy.policyType == 18).order_by(Policy.displayName):
             out = {}
             out['name'] = escape(policy.displayName)
             if should_print:
@@ -451,9 +525,11 @@ class AccessPoliciesPlugin():
                 continue
             out['who'] = self._parse_who(conditions)
             out['applications'] = self._parse_application(conditions)
+            out['authflows'] = self._parse_authflows(conditions)
             out['platforms'] = self._parse_platform(conditions)
             out['locations'] = self._parse_locations(conditions)
             out['clients'] = self._parse_clients(conditions)
+            out['signinrisks'] = self._parse_signinrisks(conditions)
             out['sessioncontrols'] = self._parse_sessioncontrols(detail)
             out['devices'] = self._parse_devices(conditions)
 
@@ -464,6 +540,64 @@ class AccessPoliciesPlugin():
             ol.append(out)
             if should_print:
                 print('####################')
+
+
+
+        for policy in self.session.query(Policy).filter(Policy.policyType == 6).order_by(Policy.displayName):
+            loc = {}
+            loc['name'] = escape(policy.displayName)
+            if should_print:
+                print()
+                print('####################')
+                print(policy.displayName)
+                print(policy.objectId)
+            detail = None
+            oldpolicy = False
+
+            for pdetail in policy.policyDetail:
+                detaildata = json.loads(pdetail)
+                if 'KnownNetworkPolicies' in detaildata:
+                    detail = detaildata['KnownNetworkPolicies']
+                    oldpolicy = True
+
+            if not oldpolicy:
+                # New format
+                detail = json.loads(policy.policyDetail[0])
+
+                if should_print:
+                    pp.pprint(detail)
+                if not detail:
+                    continue
+
+                loc['trusted'] = ("trusted" in detail.get("Categories","") if detail.get("Categories") else False)
+                loc['appliestounknowncountry'] = escape(str(detail.get("ApplyToUnknownCountry"))) if detail.get("ApplyToUnknownCountry") is not None else False
+                loc['ipranges'] = "\n<br />".join(self._parse_compressed_cidr(detail))
+                loc['categories'] = escape(", ".join(detail.get("Categories"))) if detail.get("Categories") is not None else ""
+                loc['associated_policies'] = "\n<br />".join(self._parse_associated_polcies(policy.policyIdentifier,loc['trusted'],condition_policy_list))
+                loc['country_codes'] =  escape(", ".join(detail.get("CountryIsoCodes"))) if detail.get("CountryIsoCodes") else None
+                if should_print:
+                    print(self._parse_compressed_cidr(detail))
+            else:
+                # Old format
+                if should_print:
+                    pp.pprint(detail)
+                if not detail:
+                    continue
+
+                loc['name'] = escape(detail.get("NetworkName"))
+                loc['trusted'] = ("trusted" in detail.get("Categories","") if detail.get("Categories") else False)
+                loc['appliestounknowncountry'] = escape(str(detail.get("ApplyToUnknownCountry"))) if detail.get("ApplyToUnknownCountry") is not None else False
+                loc['ipranges'] = "\n<br />".join(detail.get('CidrIpRanges'))
+                loc['categories'] = escape(", ".join(detail.get("Categories"))) if detail.get("Categories") is not None else ""
+                loc['associated_policies'] = "\n<br />".join(self._parse_associated_polcies(detail.get('NetworkId'),loc['trusted'],condition_policy_list))
+                loc['country_codes'] =  escape(", ".join(detail.get("CountryIsoCodes"))) if detail.get("CountryIsoCodes") else None
+
+
+            oloc.append(loc)
+
+
+
+
         for out in ol:
             table = '<thead><tr><td colspan="2">{0}</td></tr></thead><tbody>'.format(out['name'])
             table += '<tr><td>Applies to</td><td>{0}</td></tr>'.format(out['who'])
@@ -476,12 +610,38 @@ class AccessPoliciesPlugin():
                 table += '<tr><td>Using clients</td><td>{0}</td></tr>'.format(out['clients'])
             if out['locations'] != '':
                 table += '<tr><td>At locations</td><td>{0}</td></tr>'.format(out['locations'])
+            if out['signinrisks'] != '':
+                table += '<tr><td>Sign-in risks</td><td>{0}</td></tr>'.format(out['signinrisks'])
+            if out['authflows'] != '':
+                table += '<tr><td>Authentication flows</td><td>{0}</td></tr>'.format(out['authflows'])
             if out['controls'] != '':
                 table += '<tr><td>Controls</td><td>{0}</td></tr>'.format(out['controls'])
             if out['sessioncontrols'] != '':
                 table += '<tr><td>Session controls</td><td>{0}</td></tr>'.format(out['sessioncontrols'])
             table += '</tbody>'
             html += table
+        html += '</table>'
+        if len(oloc) > 0:
+            html += "<h1>Named Locations</h1><table>"
+            for loc in oloc:
+                table = '<thead><tr><td colspan="2">{0}</td></tr></thead><tbody>'.format(loc['name'])
+                table += '<tr><td>Trusted</td><td>{0}</td></tr>'.format(str(loc['trusted']))
+                table += '<tr><td>Apply to unknown country</td><td>{0}</td></tr>'.format(loc['appliestounknowncountry'])
+                table += '<tr><td>IP ranges</td><td>{0}</td></tr>'.format(loc['ipranges'])
+                if(loc['categories']):
+                    table += '<tr><td>Categories</td><td>{0}</td></tr>'.format(loc['categories'])
+
+                if(loc['associated_policies']):
+                    table += '<tr><td>Associated Policies</td><td>{0}</td></tr>'.format(loc['associated_policies'])
+
+                if(loc['country_codes']):
+                    table += '<tr><td>Country ISO Codes</td><td>{0}</td></tr>'.format(loc['country_codes'])
+
+                table += "</tbody>"
+
+                html += table 
+
+            html += "</table>"
         self.write_html(self.file, html)
         print('Results written to {0}'.format(self.file))
 

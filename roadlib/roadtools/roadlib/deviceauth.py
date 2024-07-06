@@ -13,6 +13,8 @@ import os
 import time
 import warnings
 import datetime
+import uuid
+import urllib3
 from cryptography.hazmat.primitives import serialization, padding, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import padding as apadding
@@ -23,8 +25,8 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.utils import CryptographyDeprecationWarning
 from roadtools.roadlib.auth import Authentication, get_data, AuthenticationException
-
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
 
 
 class DeviceAuthentication():
@@ -32,13 +34,16 @@ class DeviceAuthentication():
     Device authentication for ROADtools. Handles device registration,
     PRT request/renew and token request using WAM emulation.
     """
-    def __init__(self):
+    def __init__(self, auth=None):
         # Cryptography certificate object
         self.certificate = None
         # Cryptography private key object
         self.privkey = None
         # PEM key data
         self.keydata = None
+        # Separate transport key if applicable
+        self.transportprivkey = None
+        self.transportkeydata = None
 
         # PRT data
         self.prt = None
@@ -54,6 +59,11 @@ class DeviceAuthentication():
         # Verify TLS certs
         self.verify = True
 
+        if auth:
+            self.auth = auth
+        else:
+            self.auth = Authentication()
+
     def loadcert(self, pemfile=None, privkeyfile=None, pfxfile=None, pfxpass=None, pfxbase64=None):
         """
         Load a device certificate from disk
@@ -62,8 +72,8 @@ class DeviceAuthentication():
             with open(pemfile, "rb") as certf:
                 self.certificate = x509.load_pem_x509_certificate(certf.read())
             with open(privkeyfile, "rb") as keyf:
-                self.keydata = keyf.read()
-                self.privkey = serialization.load_pem_private_key(self.keydata, password=None)
+                self.transportkeydata = self.keydata = keyf.read()
+                self.transportprivkey = self.privkey = serialization.load_pem_private_key(self.keydata, password=None)
             return True
         if pfxfile or pfxbase64:
             if pfxfile:
@@ -71,9 +81,12 @@ class DeviceAuthentication():
                     pfxdata = pfxf.read()
             if pfxbase64:
                 pfxdata = base64.b64decode(pfxbase64)
+            if isinstance(pfxpass, str):
+                pfxpass = pfxpass.encode()
             self.privkey, self.certificate, _ = pkcs12.load_key_and_certificates(pfxdata, pfxpass)
+            self.transportprivkey = self.privkey
             # PyJWT needs the key as PEM data anyway, so encode it
-            self.keydata = self.privkey.private_bytes(
+            self.transportkeydata = self.keydata = self.privkey.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.TraditionalOpenSSL,
                 encryption_algorithm=serialization.NoEncryption(),
@@ -82,14 +95,20 @@ class DeviceAuthentication():
         print('You must specify either a PEM certificate file and private key file or a pfx file with the device keypair.')
         return False
 
-    def loadkey(self, privkeyfile=None, pfxfile=None, pfxpass=None, pfxbase64=None):
+    def loadkey(self, privkeyfile=None, pfxfile=None, pfxpass=None, pfxbase64=None, transport_only=False):
         """
         Load private key only (to use as transport key)
+        Optionally load it as transport key only and not as device key to support separate transport keys
         """
         if privkeyfile:
             with open(privkeyfile, "rb") as keyf:
-                self.keydata = keyf.read()
-                self.privkey = serialization.load_pem_private_key(self.keydata, password=None)
+                if transport_only:
+                    # Only load as transport key
+                    self.transportkeydata = keyf.read()
+                    self.transportprivkey = serialization.load_pem_private_key(self.keydata, password=None)
+                else:
+                    self.transportkeydata = self.keydata = keyf.read()
+                    self.transportprivkey = self.privkey = serialization.load_pem_private_key(self.keydata, password=None)
             return True
         if pfxfile or pfxbase64:
             if pfxfile:
@@ -97,14 +116,25 @@ class DeviceAuthentication():
                     pfxdata = pfxf.read()
             if pfxbase64:
                 pfxdata = base64.b64decode(pfxbase64)
+            if isinstance(pfxpass, str):
+                pfxpass = pfxpass.encode()
             # Load cert anyway since it's in the same file
-            self.privkey, self.certificate, _ = pkcs12.load_key_and_certificates(pfxdata, pfxpass)
-            # PyJWT needs the key as PEM data anyway, so encode it
-            self.keydata = self.privkey.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
+            if not transport_only:
+                self.privkey, self.certificate, _ = pkcs12.load_key_and_certificates(pfxdata, pfxpass)
+                self.transportprivkey = self.privkey
+                # PyJWT needs the key as PEM data anyway, so encode it
+                self.transportkeydata = self.keydata = self.privkey.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+            else:
+                self.transportprivkey, _, _ = pkcs12.load_key_and_certificates(pfxdata, pfxpass)
+                self.transportkeydata = self.privkey.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
             return True
         print('You must specify either a private key file or a pfx file with the device keypair.')
         return False
@@ -139,6 +169,109 @@ class DeviceAuthentication():
             json.dump(prtdata, prtf, sort_keys=True, indent=4)
         print(f"Saved PRT to {prtfile}")
 
+    def loadhellokey(self, privkeyfile):
+        """
+        Load Windows Hello key from file
+        """
+        if not privkeyfile:
+            return False
+        try:
+            with open(privkeyfile, "rb") as keyf:
+                self.hellokeydata = keyf.read()
+                self.hellokey = serialization.load_pem_private_key(self.hellokeydata, password=None)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def get_privkey_kid(self, key=None):
+        """
+        Get the kid (key ID) for the given key from a file
+        """
+        if not key:
+            key = self.hellokey
+
+        pubkeycngblob = self.create_pubkey_blob_from_key(key)
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(pubkeycngblob)
+        kid = base64.b64encode(digest.finalize()).decode('utf-8')
+        return kid
+
+    def create_hello_key(self, privout=None):
+        """
+        Create a key for Windows Hello, saving it to a file
+        """
+        if not privout:
+            privout = 'winhello.key'
+
+        # Generate our key
+        key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+        )
+        # Write device key to disk
+        print(f'Saving private key to {privout}')
+        with open(privout, "wb") as keyf:
+            keyf.write(key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ))
+
+        pubkeycngblob = base64.b64encode(self.create_pubkey_blob_from_key(key))
+        return key, pubkeycngblob
+
+    def create_hello_prt_assertion(self, username):
+        now = int(time.time())
+        payload = {
+          "iss": username,
+          # Should be tenant ID, but this is not verified
+          "aud": "common",
+          "iat": now-3600,
+          "exp": now+3600,
+          "request_nonce": self.auth.get_srv_challenge()['Nonce'],
+          "scope": "openid aza ugs"
+        }
+        headers = {
+            "kid": self.get_privkey_kid(),
+            "use": "ngc"
+        }
+        reqjwt = jwt.encode(payload, algorithm='RS256', key=self.hellokeydata, headers=headers)
+        return reqjwt
+
+    def get_prt_with_hello_key(self, username, assertion=None):
+        authlib = self.auth
+        challenge = authlib.get_srv_challenge()['Nonce']
+        if not assertion:
+            assertion = self.create_hello_prt_assertion(username)
+        # Construct
+        payload = {
+            "client_id": "38aa3b87-a06d-4817-b275-7a316988d93b",
+            "request_nonce": challenge,
+            "scope": "openid aza ugs",
+            # Not sure if these matter
+            "group_sids": [],
+            "win_ver": "10.0.19041.868",
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            # Windows includes this, but it is not required or used
+            # user is instead taken from JWT assertion
+            "username": username,
+            "assertion": assertion
+        }
+        return self.request_token_with_devicecert_signed_payload(payload)
+
+    def register_winhello_key(self, pubkeycngblob, access_token):
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'Dsreg/10.0 (Windows 10.0.19044.1826)',
+            'Accept': 'application/json',
+        }
+        data = {
+            "kngc": pubkeycngblob.decode('utf-8')
+        }
+        res = requests.post('https://enterpriseregistration.windows.net/EnrollmentServer/key/?api-version=1.0', json=data, headers=headers, proxies=self.proxies, verify=self.verify)
+        return res.json()
+
     def create_pubkey_blob_from_key(self, key):
         """
         Convert a key (or certificate) to RSA key blob
@@ -164,9 +297,39 @@ class DeviceAuthentication():
         pubkeycngblob = b''.join(header)+exponent_as_bytes+modulus_as_bytes
         return pubkeycngblob
 
-    def register_device(self, access_token, jointype=0, certout=None, privout=None, device_type=None, device_name=None, os_version=None):
+    def create_public_jwk_from_key(self, key, for_registration=False):
         """
-        Registers a device in Azure AD. Requires an access token to the device registration service.
+        Convert a key (or certificate) to JWK public numbers
+        https://www.rfc-editor.org/rfc/rfc7517
+        """
+        pubkey = key.public_key()
+        pubnumbers = pubkey.public_numbers()
+
+        # From python docs https://docs.python.org/3/library/stdtypes.html#int.to_bytes
+        exponent_as_bytes = pubnumbers.e.to_bytes((pubnumbers.e.bit_length() + 7) // 8, byteorder='big')
+        modulus_as_bytes = pubnumbers.n.to_bytes((pubnumbers.n.bit_length() + 7) // 8, byteorder='big')
+
+
+        if for_registration:
+            # Registration expects additional parameters and different encoding (regular base64 instead of urlsafe)
+            jwk = {
+                'kty': 'RSA',
+                'e': base64.b64encode(exponent_as_bytes).decode('utf-8'),
+                'n': base64.b64encode(modulus_as_bytes).decode('utf-8'),
+                'alg': 'RS256',
+                'kid': str(uuid.uuid4()).upper()
+            }
+        else:
+            jwk = {
+                'kty': 'RSA',
+                'e': base64.urlsafe_b64encode(exponent_as_bytes).decode('utf-8'),
+                'n': base64.urlsafe_b64encode(modulus_as_bytes).decode('utf-8'),
+            }
+        return json.dumps(jwk, separators=(',', ':'))
+
+    def register_device(self, access_token, jointype=0, certout=None, privout=None, device_type=None, device_name=None, os_version=None, deviceticket=None):
+        """
+        Registers or joins a device in Azure AD. Requires an access token to the device registration service.
         """
         # Fill in names if not supplied
         if not device_name:
@@ -182,7 +345,12 @@ class DeviceAuthentication():
             device_type = "Windows"
 
         if not os_version:
-            os_version = "10.0.19041.928"
+            if device_type.lower() == "windows":
+                os_version = "10.0.19041.928"
+            elif device_type.lower() == "macos":
+                os_version = "12.2.0"
+            elif device_type.lower() == "android":
+                os_version = "13.0"
 
         # Generate our key
         key = rsa.generate_private_key(
@@ -209,24 +377,60 @@ class DeviceAuthentication():
 
         pubkeycngblob = base64.b64encode(self.create_pubkey_blob_from_key(key))
 
-        data = {
-            "CertificateRequest":
-                {
-                    "Type": "pkcs10",
-                    "Data": certbytes.decode('utf-8')
+
+        if device_type.lower() == 'macos':
+            data = {
+                "DeviceDisplayName" : device_name,
+                "CertificateRequest" : {
+                    "Type" : "pkcs10",
+                    "Data" : certbytes.decode('utf-8')
                 },
-            "TransportKey": pubkeycngblob.decode('utf-8'),
-            # Can likely be edited to anything, are not validated afaik
-            "TargetDomain": "iminyour.cloud",
-            "DeviceType": device_type,
-            "OSVersion": os_version,
-            "DeviceDisplayName": device_name,
-            "JoinType": jointype,
-            "attributes": {
-                "ReuseDevice": "true",
-                "ReturnClientSid": "true"
+                "OSVersion" : os_version,
+                "TargetDomain" : "iminyour.cloud",
+                "AikCertificate" : "",
+                "DeviceType" : "MacOS",
+                "TransportKey" : base64.b64encode(self.create_public_jwk_from_key(key, True).encode('utf-8')).decode('utf-8'),
+                "JoinType" : jointype,
+                "AttestationData" : ""
             }
-        }
+        elif device_type.lower() == 'android':
+            data = {
+                "Attributes": {},
+                "CertificateRequest":
+                {
+                    "Data": certbytes.decode('utf-8'),
+                    "Type": "pkcs10"
+                },
+                "DeviceDisplayName": device_name,
+                "DeviceType": "Android",
+                "JoinType": jointype,
+                "OSVersion": os_version,
+                "TargetDomain": "6287f28f-4f7f-4322-9651-a8697d8fe1bc",
+                "TransportKey": base64.b64encode(self.create_public_jwk_from_key(key, True).encode('utf-8')).decode('utf-8'),
+            }
+        else:
+            data = {
+                "CertificateRequest":
+                    {
+                        "Type": "pkcs10",
+                        "Data": certbytes.decode('utf-8')
+                    },
+                "TransportKey": pubkeycngblob.decode('utf-8'),
+                # Can likely be edited to anything, are not validated afaik
+                "TargetDomain": "iminyour.cloud",
+                "DeviceType": device_type,
+                "OSVersion": os_version,
+                "DeviceDisplayName": device_name,
+                "JoinType": jointype,
+                "attributes": {
+                    "ReuseDevice": "true",
+                    "ReturnClientSid": "true"
+                }
+            }
+            # Add device ticket if requested
+            if deviceticket:
+                data['attributes']['MSA-DDID'] = base64.b64encode(deviceticket.encode('utf-8')).decode('utf-8')
+
 
         headers = {
             'Authorization': f'Bearer {access_token}',
@@ -234,7 +438,7 @@ class DeviceAuthentication():
         }
 
         print('Registering device')
-        res = requests.post('https://enterpriseregistration.windows.net/EnrollmentServer/device/?api-version=2.0', json=data, headers=headers, proxies=self.proxies, verify=self.verify)
+        res = self.auth.requests_post('https://enterpriseregistration.windows.net/EnrollmentServer/device/?api-version=2.0', json=data, headers=headers, proxies=self.proxies, verify=self.verify)
         returndata = res.json()
         if not 'Certificate' in returndata:
             print('Error registering device! Got response:')
@@ -370,28 +574,55 @@ class DeviceAuthentication():
         print('Device was deleted in Azure AD')
         return True
 
-    def request_token_with_devicecert_signed_payload(self, payload):
+    def request_token_with_devicecert_signed_payload(self, payload, use_v3=False, reqclientinfo=True, reqtgt=True, returnreply=False):
         """
         Wrap the request payload in a JWT and sign this using the device cert / key
         """
         certder = self.certificate.public_bytes(serialization.Encoding.DER)
         certbytes = base64.b64encode(certder)
-        headers = {
-          "x5c": certbytes.decode('utf-8'),
-          "kdf_ver": 2
-        }
-        reqjwt = jwt.encode(payload, algorithm='RS256', key=self.keydata, headers=headers)
-        prt_request_data = {
-            'windows_api_version':'2.2',
-            'grant_type':'urn:ietf:params:oauth:grant-type:jwt-bearer',
-            'request':reqjwt,
-            'client_info':'1',
-            'tgt':True
-        }
-        res = requests.post('https://login.microsoftonline.com/common/oauth2/token', data=prt_request_data, proxies=self.proxies, verify=self.verify)
+        authority_uri = self.auth.get_authority_url()
+        if not use_v3:
+            # Windows API flow - uses identity platform v1 endpoint
+            headers = {
+              "x5c": certbytes.decode('utf-8'),
+              "kdf_ver": 2
+            }
+            reqjwt = jwt.encode(payload, algorithm='RS256', key=self.keydata, headers=headers)
+            prt_request_data = {
+                'windows_api_version':'2.2',
+                'grant_type':'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                'request':reqjwt,
+            }
+            if reqclientinfo:
+                prt_request_data['client_info'] = '1'
+            if reqtgt:
+                prt_request_data['tgt'] = True
+            url = f'{authority_uri}/oauth2/token'
+        else:
+            # PRT Protocol version 3 flow, uses identity platform v2
+            headers = {
+              "x5c": certbytes.decode('utf-8'),
+            }
+            reqjwt = jwt.encode(payload, algorithm='RS256', key=self.keydata, headers=headers)
+            prt_request_data = {
+                'prt_protocol_version':'3.0',
+                'grant_type':'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                'request':reqjwt,
+            }
+            if reqclientinfo:
+                prt_request_data['client_info'] = '1'
+            url = f'{authority_uri}/oauth2/v2.0/token'
+
+        res = self.auth.requests_post(url, data=prt_request_data, proxies=self.proxies, verify=self.verify)
+
         if res.status_code != 200:
             raise AuthenticationException(res.text)
         prtdata = res.json()
+
+        # Return the reply if wanted, needed for non-prt flows using similar requests
+        if returnreply:
+            return prtdata
+
         # Encrypted session key that we need to unwrap
         sessionkey_jwe = prtdata['session_key_jwe']
         uwk = self.decrypt_jwe_with_transport_key(sessionkey_jwe)
@@ -419,7 +650,7 @@ class DeviceAuthentication():
         wrapped_key = get_data(dataparts[1])
 
         # borrowed from https://github.com/mpdavis/python-jose/blob/16bde1737d8a4f498db2333e5fc7d191e0fc915f/jose/backends/cryptography_backend.py#L514
-        uwk = self.privkey.decrypt(wrapped_key, apadding.OAEP(apadding.MGF1(hashes.SHA1()), hashes.SHA1(), None))
+        uwk = self.transportprivkey.decrypt(wrapped_key, apadding.OAEP(apadding.MGF1(hashes.SHA1()), hashes.SHA1(), None))
         return uwk
 
     def request_token_with_sessionkey_signed_payload(self, payload, reqtgt=True):
@@ -427,7 +658,7 @@ class DeviceAuthentication():
         Request a token (access / refresh / PRT) using a payload signed
         with the PRT session key.
         """
-        authlib = Authentication()
+        authority_uri = self.auth.get_authority_url()
         context = os.urandom(24)
         headers = {
             'ctx': base64.b64encode(context).decode('utf-8'), #.rstrip('=')
@@ -439,7 +670,7 @@ class DeviceAuthentication():
         jwtbody = base64.b64decode(jbody+('='*(len(jbody)%4)))
 
         # Now calculate the derived key based on random context plus jwt body
-        _, derived_key = authlib.calculate_derived_key_v2(self.session_key, context, jwtbody)
+        _, derived_key = self.auth.calculate_derived_key_v2(self.session_key, context, jwtbody)
         reqjwt = jwt.encode(payload, derived_key, algorithm='HS256', headers=headers)
 
         token_request_data = {
@@ -448,9 +679,48 @@ class DeviceAuthentication():
             'request':reqjwt,
             'client_info':'1'
         }
+        if self.auth.use_cae:
+            token_request_data['claims'] = '{"access_token":{"xms_cc":{"values":["CP1"]}}}'
         if reqtgt:
             token_request_data['tgt'] = True
-        res = requests.post('https://login.microsoftonline.com/common/oauth2/token', data=token_request_data, proxies=self.proxies, verify=self.verify)
+        res = self.auth.requests_post(f'{authority_uri}/oauth2/token', data=token_request_data, proxies=self.proxies, verify=self.verify)
+        if res.status_code != 200:
+            raise AuthenticationException(res.text)
+        responsedata = res.text
+        return responsedata
+
+    def request_token_with_sessionkey_signed_payload_prtprotocolv3(self, payload, reqtgt=True):
+        """
+        Request a token (access / refresh / PRT) using a payload signed
+        with the PRT session key. Uses PRT Protocol version 3
+        """
+        context = os.urandom(24)
+        headers = {
+            'ctx': base64.b64encode(context).decode('utf-8'),
+            'kdf_ver': 2
+        }
+
+        # Sign with random key just to get jwt body in right encoding
+        tempjwt = jwt.encode(payload, os.urandom(32), algorithm='HS256', headers=headers)
+        jbody = tempjwt.split('.')[1]
+        jwtbody = base64.b64decode(jbody+('='*(len(jbody)%4)))
+
+        # Now calculate the derived key based on random context plus jwt body
+        _, derived_key = self.auth.calculate_derived_key_v2(self.session_key, context, jwtbody)
+
+        # Uncomment to use KDFv1
+        # _, derived_key = authlib.calculate_derived_key(self.session_key, context)
+        reqjwt = jwt.encode(payload, derived_key, algorithm='HS256', headers=headers)
+
+        token_request_data = {
+            'prt_protocol_version':'3.0',
+            'grant_type':'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            'request':reqjwt,
+            'client_info':'1'
+        }
+        if reqtgt:
+            token_request_data['tgt'] = True
+        res = self.auth.requests_post('https://login.microsoftonline.com/common/oauth2/v2.0/token', data=token_request_data, proxies=self.proxies, verify=self.verify)
         if res.status_code != 200:
             raise AuthenticationException(res.text)
         responsedata = res.text
@@ -470,6 +740,22 @@ class DeviceAuthentication():
             "grant_type": "password",
             "username": username,
             "password": password,
+        }
+        return self.request_token_with_devicecert_signed_payload(payload)
+
+    def get_prt_with_samltoken(self, samltoken):
+        authlib = Authentication()
+        challenge = authlib.get_srv_challenge()['Nonce']
+        # Construct
+        payload = {
+            "client_id": "38aa3b87-a06d-4817-b275-7a316988d93b",
+            "request_nonce": challenge,
+            "scope": "openid aza ugs",
+            # Not sure if these matter
+            "group_sids": [],
+            "win_ver": "10.0.19041.868",
+            "grant_type": "urn:ietf:params:oauth:grant-type:saml1_1-bearer",
+            "assertion": base64.b64encode(samltoken.encode('utf-8')).decode('utf-8'),
         }
         return self.request_token_with_devicecert_signed_payload(payload)
 
@@ -518,16 +804,18 @@ class DeviceAuthentication():
         challenge = authlib.get_srv_challenge()['Nonce']
         client = authlib.lookup_client_id(client_id).lower()
         payload = {
-          "win_ver": "10.0.19041.1620",
-          "scope": "openid",
-          "resource": authlib.lookup_resource_uri(resource),
-          "request_nonce": challenge,
-          "refresh_token": self.prt,
-          "redirect_uri": f"ms-appx-web://Microsoft.AAD.BrokerPlugin/{client}",
-          "iss": "aad:brokerplugin",
-          "grant_type": "refresh_token",
-          "client_id": f"{client}",
-          "aud": "login.microsoftonline.com"
+            "win_ver": "10.0.19041.1620",
+            "scope": "openid",
+            "resource": authlib.lookup_resource_uri(resource),
+            "request_nonce": challenge,
+            "refresh_token": self.prt,
+            "redirect_uri": f"ms-appx-web://Microsoft.AAD.BrokerPlugin/{client}",
+            "iss": "aad:brokerplugin",
+            "grant_type": "refresh_token",
+            "client_id": client,
+            "aud": "login.microsoftonline.com",
+            "iat": str(int(time.time())),
+            "exp": str(int(time.time())+(3600)),
         }
         # Request a new PRT, otherwise normal refresh token will be issued
         if renew_prt:

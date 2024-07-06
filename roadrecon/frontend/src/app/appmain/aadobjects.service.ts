@@ -31,6 +31,17 @@ export interface GroupsItem {
   ownerServicePrincipals: ServicePrincipalsItem[];
 }
 
+export interface AdministrativeUnitsItem {
+  displayName: string;
+  description: string;
+  objectId: string;
+  objectType: string;
+  membershipRule: string;
+  memberUsers: UsersItem[];
+  memberDevices: DevicesItem[];
+  memberGroups: GroupsItem[];
+}
+
 export interface DirectoryRolesItem {
   description: string;
   displayName: string;
@@ -39,6 +50,24 @@ export interface DirectoryRolesItem {
   memberUsers: UsersItem[];
   memberServicePrincipals: ServicePrincipalsItem[];
   memberGroups: GroupsItem[];
+}
+
+export interface RoleAssignmentsItem {
+  type: string;
+  scope: string[];
+  scopeIds: string[];
+  scopeNames: string[];
+  scopeTypes: string[];
+  principal: (UsersItem | ServicePrincipalsItem | GroupsItem)[];
+}
+
+export interface RoleDefinitionsItem {
+  description: string;
+  displayName: string;
+  objectId: string;
+  templateId: string;
+  isBuiltIn: boolean;
+  assignments: RoleAssignmentsItem[];
 }
 
 export interface ApplicationsItem {
@@ -117,6 +146,7 @@ export interface ServicePrincipalsItem {
   displayName: string;
   appDisplayName: string;
   appOwnerTenantId: string;
+  appRoleAssignmentRequired: boolean;
   publisherName: string;
   appId: string;
   appMetadata: appMetadata;
@@ -145,12 +175,21 @@ export interface TenantDetail {
 
 }
 
+export interface DirectorySetting {
+  displayName: string;
+  id: string;
+  templateId: string;
+  values: { name: string, value: string }[];
+
+}
+
 export interface TenantStats {
   countUsers: number;
   countGroups: number;
   countApplications: number;
   countServicePrincipals: number;
   countDevices: number;
+  countAdministrativeUnits: number;
 }
 
 export interface AppRolesItem {
@@ -199,7 +238,7 @@ export interface AuthorizationPolicy {
     description: string;
     enabledPreviewFeatures: object;
     guestUserRoleId: string;
-    permissionGrantPolicyIdsAssignedToDefaultUserRole: object[];
+    permissionGrantPolicyIdsAssignedToDefaultUserRole: string[];
 }
 
 @Injectable({
@@ -233,6 +272,14 @@ export class DatabaseService {
       return this.http.get<GroupsItem>(environment.apibase + 'groups/'+ id);
   }
 
+  public getAdministrativeUnits():  Observable<AdministrativeUnitsItem[]> {
+      return this.http.get<AdministrativeUnitsItem[]>(environment.apibase + 'administrativeunits');
+  }
+
+  public getAdministrativeUnit(id):  Observable<AdministrativeUnitsItem> {
+      return this.http.get<AdministrativeUnitsItem>(environment.apibase + 'administrativeunits/'+ id);
+  }
+
   public getServicePrincipals():  Observable<ServicePrincipalsItem[]> {
       return this.http.get<ServicePrincipalsItem[]>(environment.apibase + 'serviceprincipals');
   }
@@ -257,12 +304,20 @@ export class DatabaseService {
       return this.http.get<DirectoryRolesItem[]>(environment.apibase + 'directoryroles');
   }
 
+  public getRoleDefinitions():  Observable<RoleDefinitionsItem[]> {
+      return this.http.get<RoleDefinitionsItem[]>(environment.apibase + 'roledefinitions');
+  }
+
   public getTenantStats():  Observable<TenantStats> {
       return this.http.get<TenantStats>(environment.apibase + 'stats');
   }
 
   public getTenantDetail():  Observable<TenantDetail> {
       return this.http.get<TenantDetail>(environment.apibase + 'tenantdetails');
+  }
+  
+  public getDirectorySetting():  Observable<DirectorySetting> {
+      return this.http.get<DirectorySetting>(environment.apibase + 'directorysettings');
   }
 
   public getAuthorizationPolicies(): Observable<AuthorizationPolicy[]> {
@@ -349,6 +404,28 @@ export class GroupsResolveService implements Resolve<GroupsItem> {
           return of(group);
         } else { // id not found
           this.router.navigate(['/groups']);
+          return EMPTY;
+        }
+      })
+    );
+  }
+}
+
+@Injectable({
+  providedIn: 'root',
+})
+export class AdministrativeUnitsResolveService implements Resolve<AdministrativeUnitsItem> {
+  constructor(private dbservice: DatabaseService, private router: Router) {}
+
+  resolve(route: ActivatedRouteSnapshot, state: RouterStateSnapshot): Observable<AdministrativeUnitsItem> | Observable<never> {
+    let id = route.paramMap.get('id');
+
+    return this.dbservice.getAdministrativeUnit(id).pipe(
+      mergeMap(administrativeunit => {
+        if (administrativeunit) {
+          return of(administrativeunit);
+        } else { // id not found
+          this.router.navigate(['/administrativeunits']);
           return EMPTY;
         }
       })
