@@ -16,11 +16,12 @@ import datetime
 import uuid
 import urllib3
 from cryptography.hazmat.primitives import serialization, padding, hashes
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.hazmat.primitives.asymmetric import padding as apadding
 from cryptography.hazmat.primitives.keywrap import aes_key_unwrap
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.utils import CryptographyDeprecationWarning
@@ -262,14 +263,14 @@ class DeviceAuthentication():
     def register_winhello_key(self, pubkeycngblob, access_token):
         headers = {
             'Authorization': f'Bearer {access_token}',
-            'Content-Type': 'application/json',
             'User-Agent': 'Dsreg/10.0 (Windows 10.0.19044.1826)',
+            'Content-Type': 'application/json',
             'Accept': 'application/json',
         }
         data = {
             "kngc": pubkeycngblob.decode('utf-8')
         }
-        res = requests.post('https://enterpriseregistration.windows.net/EnrollmentServer/key/?api-version=1.0', json=data, headers=headers, proxies=self.proxies, verify=self.verify)
+        res = self.auth.requests_post('https://enterpriseregistration.windows.net/EnrollmentServer/key/?api-version=1.0', json=data, headers=headers, proxies=self.proxies, verify=self.verify)
         return res.json()
 
     def create_pubkey_blob_from_key(self, key):
@@ -327,7 +328,28 @@ class DeviceAuthentication():
             }
         return json.dumps(jwk, separators=(',', ':'))
 
-    def register_device(self, access_token, jointype=0, certout=None, privout=None, device_type=None, device_name=None, os_version=None, deviceticket=None):
+    def create_public_jwk_from_ec_key(self, key):
+        """
+        Convert a key (or certificate) to JWK public numbers
+        https://www.rfc-editor.org/rfc/rfc7517
+        """
+        pubkey = key.public_key()
+        pubnumbers = pubkey.public_numbers()
+
+        # From python docs https://docs.python.org/3/library/stdtypes.html#int.to_bytes
+        x_as_bytes = pubnumbers.x.to_bytes((pubnumbers.x.bit_length() + 7) // 8, byteorder='big')
+        y_as_bytes = pubnumbers.y.to_bytes((pubnumbers.y.bit_length() + 7) // 8, byteorder='big')
+
+        jwk = {
+            'kty': 'EC',
+            'x': base64.b64encode(x_as_bytes).decode('utf-8'),
+            'y': base64.b64encode(y_as_bytes).decode('utf-8'),
+            'crv': 'P-256',
+            'kid': str(uuid.uuid4()).upper()
+        }
+        return json.dumps(jwk, separators=(',', ':'))
+
+    def register_device(self, access_token, jointype=0, certout=None, privout=None, device_type=None, device_name=None, os_version=None, deviceticket=None, device_domain=None):
         """
         Registers or joins a device in Azure AD. Requires an access token to the device registration service.
         """
@@ -335,6 +357,7 @@ class DeviceAuthentication():
         if not device_name:
             device_name = 'DESKTOP-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
+        # Fill in names if not supplied
         if not certout:
             certout = device_name.lower() + '.pem'
 
@@ -349,22 +372,39 @@ class DeviceAuthentication():
                 os_version = "10.0.19041.928"
             elif device_type.lower() == "macos":
                 os_version = "12.2.0"
+            elif device_type.lower() == "macos14":
+                os_version = "14.5.0"
             elif device_type.lower() == "android":
                 os_version = "13.0"
 
-        # Generate our key
-        key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-        )
-        # Write device key to disk
-        print(f'Saving private key to {privout}')
-        with open(privout, "wb") as keyf:
-            keyf.write(key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            ))
+        if not device_domain:
+            device_domain = "iminyour.cloud"
+
+        if device_type.lower() != "macos14":
+            # Generate our key
+            key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+            # Write device key to disk
+            print(f'Saving private key to {privout}')
+            with open(privout, "wb") as keyf:
+                keyf.write(key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                ))
+        else:
+            key = ec.generate_private_key(
+                ec.SECP256R1()
+            )
+            print(f'Saving private key to {privout}')
+            with open(privout, "wb") as keyf:
+                keyf.write(key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                ))
 
         # Generate a CSR
         csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
@@ -375,10 +415,9 @@ class DeviceAuthentication():
         certreq = csr.public_bytes(serialization.Encoding.DER)
         certbytes = base64.b64encode(certreq)
 
-        pubkeycngblob = base64.b64encode(self.create_pubkey_blob_from_key(key))
-
-
+        api_version = "2.0"
         if device_type.lower() == 'macos':
+            user_agent = 'DeviceRegistrationClient'
             data = {
                 "DeviceDisplayName" : device_name,
                 "CertificateRequest" : {
@@ -386,14 +425,41 @@ class DeviceAuthentication():
                     "Data" : certbytes.decode('utf-8')
                 },
                 "OSVersion" : os_version,
-                "TargetDomain" : "iminyour.cloud",
+                "TargetDomain" : device_domain,
                 "AikCertificate" : "",
                 "DeviceType" : "MacOS",
                 "TransportKey" : base64.b64encode(self.create_public_jwk_from_key(key, True).encode('utf-8')).decode('utf-8'),
                 "JoinType" : jointype,
                 "AttestationData" : ""
             }
+        elif device_type.lower() == 'macos14':
+            user_agent = 'DeviceRegistrationClient'
+            api_version = "3.0"
+            data = {
+              "AikCertificate" : "",
+              "AttestationData" : "",
+              "CertificateRequest" : {
+                "Data" : certbytes.decode('utf-8'),
+                "KeySecurity" : "SecureEnclave",
+                "KeyType" : "ECC",
+                "Type" : "pkcs10"
+              },
+              "DeviceDisplayName" : device_name,
+              "DeviceKeys" : [
+                {
+                  "Data" : self.create_public_jwk_from_ec_key(key),
+                  "Encoding" : "JWK",
+                  "Type" : "ECC",
+                  "Usage" : "STK"
+                }
+              ],
+              "DeviceType" : "MacOS",
+              "JoinType" : jointype,
+              "OSVersion" : "14.5.0",
+              "TargetDomain" : "iminyour.cloud"
+            }
         elif device_type.lower() == 'android':
+            user_agent = 'DeviceRegistrationClient'
             data = {
                 "Attributes": {},
                 "CertificateRequest":
@@ -409,6 +475,8 @@ class DeviceAuthentication():
                 "TransportKey": base64.b64encode(self.create_public_jwk_from_key(key, True).encode('utf-8')).decode('utf-8'),
             }
         else:
+            user_agent = f'Dsreg/10.0 (Windows {os_version})'
+            pubkeycngblob = base64.b64encode(self.create_pubkey_blob_from_key(key))
             data = {
                 "CertificateRequest":
                     {
@@ -417,7 +485,7 @@ class DeviceAuthentication():
                     },
                 "TransportKey": pubkeycngblob.decode('utf-8'),
                 # Can likely be edited to anything, are not validated afaik
-                "TargetDomain": "iminyour.cloud",
+                "TargetDomain": device_domain,
                 "DeviceType": device_type,
                 "OSVersion": os_version,
                 "DeviceDisplayName": device_name,
@@ -433,12 +501,13 @@ class DeviceAuthentication():
 
 
         headers = {
+            'User-Agent': user_agent,
             'Authorization': f'Bearer {access_token}',
             'Content-Type': 'application/json'
         }
 
         print('Registering device')
-        res = self.auth.requests_post('https://enterpriseregistration.windows.net/EnrollmentServer/device/?api-version=2.0', json=data, headers=headers, proxies=self.proxies, verify=self.verify)
+        res = self.auth.requests_post(f'https://enterpriseregistration.windows.net/EnrollmentServer/device/?api-version={api_version}', json=data, headers=headers, proxies=self.proxies, verify=self.verify)
         returndata = res.json()
         if not 'Certificate' in returndata:
             print('Error registering device! Got response:')
@@ -457,19 +526,26 @@ class DeviceAuthentication():
         '''
         Register hybrid device. Requires existing key/cert to be already loaded and the SID to be specified.
         Device should be synced to AAD already, otherwise this will fail.
+        Note that certout and privout will be suffixed with the _aad suffix in the actual output to prevent overwriting the original self-signed cert
         '''
-        # Fill in names if not supplied
+        # Get device name from cert if not supplied
         if not device_name:
-            device_name = 'DESKTOP-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-
-        certout = device_name.lower() + '_aad.pem'
-        privout = device_name.lower() + '_aad.key'
+            certname = certout.rsplit('.', 1)
+            if len(certname) > 1:
+                device_name = certname[0]
+            else:
+                device_name = certname
+            print(f"Assuming device name {device_name} from certificate file name")
 
         if not device_type:
             device_type = "Windows"
 
         if not os_version:
             os_version = "10.0.19041.928"
+
+        # Output keys have the _aad suffix to prevent overwriting original cert + key
+        certout = device_name.lower() + '_aad.pem'
+        privout = device_name.lower() + '_aad.key'
 
         # Generate our new shiny key
         key = rsa.generate_private_key(
@@ -485,7 +561,7 @@ class DeviceAuthentication():
                 encryption_algorithm=serialization.NoEncryption(),
             ))
 
-        # Generate a CSR
+        # Generate a CSR that will give us an Azure AD signed cert
         csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "7E980AD9-B86D-4306-9425-9AC066FB014A"),
         ])).sign(key, hashes.SHA256())
@@ -512,7 +588,7 @@ class DeviceAuthentication():
             "ServerAdJoinData":
             {
                 "TransportKey": pubkeycngblob.decode('utf-8'),
-                "TargetDomain": "iminyour.cloud",
+                "TargetDomain": tenantid,
                 "DeviceType": device_type,
                 "OSVersion": os_version,
                 "DeviceDisplayName": device_name,
@@ -726,6 +802,57 @@ class DeviceAuthentication():
         responsedata = res.text
         return responsedata
 
+    def calculate_derived_key_ecdh(self, responsedata, apv):
+        '''
+        Use ECDH with transport key to calculate the derived key
+        using Concat KDF
+        '''
+        def jwk_to_crypto(jwk):
+            public_numbers = ec.EllipticCurvePublicNumbers(
+                curve=ec.SECP256R1(),
+                x=int.from_bytes(get_data(jwk['x']), byteorder="big"),
+                y=int.from_bytes(get_data(jwk['y']), byteorder="big"),
+            )
+            if 'd' in jwk:
+                privkey = ec.EllipticCurvePrivateNumbers(
+                        int.from_bytes(get_data(jwk['d']), byteorder="big"), public_numbers
+                ).private_key()
+                return privkey, privkey.public_key()
+            return None, public_numbers.public_key()
+
+        headerdata, enckey, iv, ciphertext, authtag = responsedata.split('.')
+        headers = json.loads(get_data(headerdata))
+
+        _, pubkey = jwk_to_crypto(headers['epk'])
+        exchanged_key = self.transportprivkey.exchange(ec.ECDH(), pubkey)
+
+        # AlgorithmID
+        alg = 'A256GCM'
+        otherinfo = struct.pack('>I', len(alg))
+        otherinfo += bytes(alg.encode('utf8'))
+
+        # PartyUInfo
+        apu = get_data(headers['apu'])
+        otherinfo += struct.pack('>I', len(apu))
+        otherinfo += apu
+
+        # PartyVInfo
+        apv = get_data(apv)
+        otherinfo += struct.pack('>I', len(apv))
+        otherinfo += apv
+
+        # SuppPubInfo
+        otherinfo += struct.pack('>I', 256)
+
+        # Derive key with Concat KDF
+        ckdf = ConcatKDFHash(
+            algorithm=hashes.SHA256(),
+            length=32,
+            otherinfo=otherinfo,
+        )
+        derived_key = ckdf.derive(exchanged_key)
+        return self.auth.decrypt_auth_response_derivedkey(headerdata, ciphertext, iv, authtag, derived_key)
+
     def get_prt_with_password(self, username, password):
         authlib = Authentication()
         challenge = authlib.get_srv_challenge()['Nonce']
@@ -746,7 +873,7 @@ class DeviceAuthentication():
     def get_prt_with_samltoken(self, samltoken):
         authlib = Authentication()
         challenge = authlib.get_srv_challenge()['Nonce']
-        # Construct
+        # Construct request payload
         payload = {
             "client_id": "38aa3b87-a06d-4817-b275-7a316988d93b",
             "request_nonce": challenge,
@@ -758,6 +885,23 @@ class DeviceAuthentication():
             "assertion": base64.b64encode(samltoken.encode('utf-8')).decode('utf-8'),
         }
         return self.request_token_with_devicecert_signed_payload(payload)
+
+    def get_token_for_device(self, client_id, resource, redirect_uri=None):
+        challenge = self.auth.get_srv_challenge()['Nonce']
+        # Construct request payload
+        payload = {
+          "resource": resource,
+          "client_id": client_id,
+          "request_nonce": challenge,
+          "win_ver": "10.0.22621.608",
+          "grant_type": "device_token",
+          "redirect_uri": f"ms-appx-web://Microsoft.AAD.BrokerPlugin/{client_id}",
+          "iss": "aad:brokerplugin"
+        }
+        # Custom redirect_uri if needed
+        if redirect_uri:
+            payload['redirect_uri'] = redirect_uri
+        return self.request_token_with_devicecert_signed_payload(payload, reqtgt=False, reqclientinfo=False, returnreply=True)
 
     def get_prt_with_refresh_token(self, refresh_token):
         authlib = Authentication()

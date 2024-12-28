@@ -45,6 +45,7 @@ class Authentication():
         self.password = password
         self.tenant = tenant
         self.client_id = None
+        self.origin = None
         self.set_client_id(client_id)
         self.resource_uri = 'https://graph.windows.net/'
         self.tokendata = {}
@@ -79,6 +80,13 @@ class Authentication():
         """
         self.client_id = self.lookup_client_id(clid)
 
+    def set_origin_value(self, origin):
+        """
+        Sets Origin header to use
+        """
+        self.origin = origin
+        adal.oauth2_client._REQ_OPTION['headers']['Origin'] = self.origin
+
     def set_resource_uri(self, uri):
         """
         Sets resource URI to use (accepts aliases)
@@ -112,6 +120,11 @@ class Authentication():
         if pemfile and privkeyfile:
             with open(pemfile, "rb") as certf:
                 self.appcertificate = x509.load_pem_x509_certificate(certf.read())
+            with open(privkeyfile, "rb") as keyf:
+                self.appkeydata = keyf.read()
+                self.appprivkey = serialization.load_pem_private_key(self.appkeydata, password=None)
+            return True
+        if privkeyfile:
             with open(privkeyfile, "rb") as keyf:
                 self.appkeydata = keyf.read()
                 self.appprivkey = serialization.load_pem_private_key(self.appkeydata, password=None)
@@ -157,6 +170,102 @@ class Authentication():
         context = adal.AuthenticationContext(authority_uri, api_version=None, proxies=self.proxies, verify_ssl=self.verify)
         self.tokendata = context.acquire_token_with_username_password(self.resource_uri, self.username, self.password, self.client_id)
 
+        return self.tokendata
+
+    def authenticate_device_code_native(self, additionaldata=None, returnreply=False):
+        """
+        Authenticate with device code flow
+        Native version without adal
+        """
+        authority_uri = self.get_authority_url()
+        data = {
+            "client_id": self.client_id,
+            "resource": self.resource_uri,
+        }
+        if self.scope:
+            data['scope'] = self.scope
+        if additionaldata:
+            data = {**data, **additionaldata}
+        res = self.requests_post(f"{authority_uri}/oauth2/devicecode", data=data)
+        if res.status_code != 200:
+            raise AuthenticationException(res.text)
+        responsedata = res.json()
+        print(responsedata['message'])
+        # print(f"Code expires in {responsedata['expires_in']} seconds")
+        interval = float(responsedata['interval'])
+        device_code = responsedata['device_code']
+
+        polldata = {
+            "client_id": self.client_id,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "code": device_code
+        }
+        while True:
+            time.sleep(interval)
+            res = self.requests_post(f"{authority_uri}/oauth2/token", data=polldata)
+            tokenreply = res.json()
+            if res.status_code != 200:
+                # Keep polling
+                if tokenreply['error'] == 'authorization_pending':
+                    continue
+                if tokenreply['error'] in ('expired_token', 'code_expired'):
+                    raise AuthenticationException("The code has expired.")
+                if tokenreply['error'] == 'authorization_declined':
+                    raise AuthenticationException("The user declined the sign-in.")
+                # If not handled, raise
+                raise AuthenticationException(res.text)
+            # Else break out of the loop
+            break
+        if returnreply:
+            return tokenreply
+        self.tokendata = self.tokenreply_to_tokendata(tokenreply)
+        return self.tokendata
+
+    def authenticate_device_code_native_v2(self, additionaldata=None, returnreply=False):
+        """
+        Authenticate with device code flow
+        Native version without adal
+        """
+        authority_uri = self.get_authority_url()
+        data = {
+            "client_id": self.client_id,
+            "scope": self.scope,
+        }
+        if additionaldata:
+            data = {**data, **additionaldata}
+        res = self.requests_post(f"{authority_uri}/oauth2/v2.0/devicecode", data=data)
+        if res.status_code != 200:
+            raise AuthenticationException(res.text)
+        responsedata = res.json()
+        print(responsedata['message'])
+        # print(f"Code expires in {responsedata['expires_in']} seconds")
+        interval = float(responsedata['interval'])
+        device_code = responsedata['device_code']
+
+        polldata = {
+            "client_id": self.client_id,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "code": device_code
+        }
+        while True:
+            time.sleep(interval)
+            res = self.requests_post(f"{authority_uri}/oauth2/v2.0/token", data=polldata)
+            tokenreply = res.json()
+            if res.status_code != 200:
+                # Keep polling
+                if tokenreply['error'] == 'authorization_pending':
+                    continue
+                if tokenreply['error'] in ('expired_token', 'code_expired'):
+                    raise AuthenticationException("The code has expired.")
+                if tokenreply['error'] == 'authorization_declined':
+                    raise AuthenticationException("The user declined the sign-in.")
+                # If not handled, raise
+                raise AuthenticationException(res.text)
+            # Else break out of the loop
+            break
+        if returnreply:
+            return tokenreply
+        self.tokendata = self.tokenreply_to_tokendata(tokenreply)
         return self.tokendata
 
     def authenticate_username_password_native(self, client_secret=None, additionaldata=None, returnreply=False):
@@ -219,7 +328,7 @@ class Authentication():
 
     def authenticate_as_app(self):
         """
-        Authenticate with an APP id + secret (password credentials assigned to serviceprinicpal)
+        Authenticate with an APP id + secret (password credentials assigned to app or service principal)
         """
         authority_uri = self.get_authority_url()
 
@@ -254,8 +363,6 @@ class Authentication():
         tokenreply = res.json()
         if returnreply:
             return tokenreply
-        access_token = tokenreply['access_token']
-        tokens = access_token.split('.')
         self.tokendata = self.tokenreply_to_tokendata(tokenreply)
         return self.tokendata
 
@@ -287,8 +394,6 @@ class Authentication():
         tokenreply = res.json()
         if returnreply:
             return tokenreply
-        access_token = tokenreply['access_token']
-        tokens = access_token.split('.')
         self.tokendata = self.tokenreply_to_tokendata(tokenreply)
         return self.tokendata
 
@@ -317,11 +422,21 @@ class Authentication():
         }
         return jwt.encode(payload, algorithm='RS256', key=self.appkeydata, headers=headers)
 
-    def generate_federated_assertion(self, appkeypem, kid, iss, sub, aud='api://AzureADTokenExchange'):
+    def generate_federated_assertion(self, iss, sub, kid=None, aud='api://AzureADTokenExchange'):
         """
         Generate a federated assertion for the specified key ID, issuer, subject and audience.
-        Appkeypem should be a PEM encoded private key (as bytes)
+        Appkeypem should be a PEM encoded private key (as bytes), if not specified it should already be loaded
         """
+        if not kid:
+            # Calculate as thumbprint of cert
+            if not self.appcertificate:
+                raise ValueError('Either an app certificate should be specified or a manual key ID (kid) should be provided')
+            data = self.appcertificate.public_bytes(
+                serialization.Encoding.DER
+            )
+            digest = hashes.Hash(hashes.SHA1())
+            digest.update(data)
+            kid = base64.urlsafe_b64encode(digest.finalize()).decode('utf-8')
         headers = {
             'kid':kid
         }
@@ -334,7 +449,7 @@ class Authentication():
             "jti": str(uuid.uuid4()),
             "sub": sub
         }
-        return jwt.encode(payload, algorithm='RS256', key=appkeypem, headers=headers)
+        return jwt.encode(payload, algorithm='RS256', key=self.appkeydata, headers=headers)
 
     def authenticate_with_code(self, code, redirurl, client_secret=None):
         """
@@ -363,6 +478,8 @@ class Authentication():
         inputdata = json.loads(base64.b64decode(tokens[1]+('='*(len(tokens[1])%4))))
         self.tokendata['_clientId'] = self.client_id
         self.tokendata['tenantId'] = inputdata['tid']
+        if self.origin:
+            self.tokendata['originheader'] = self.origin
         return self.tokendata
 
     def authenticate_with_refresh_native(self, refresh_token, client_secret=None, additionaldata=None, returnreply=False):
@@ -390,6 +507,8 @@ class Authentication():
         access_token = tokenreply['access_token']
         tokens = access_token.split('.')
         self.tokendata = self.tokenreply_to_tokendata(tokenreply)
+        if self.origin:
+            self.tokendata['originheader'] = self.origin
         return self.tokendata
 
     def authenticate_with_refresh_native_v2(self, refresh_token, client_secret=None, additionaldata=None, returnreply=False):
@@ -418,6 +537,8 @@ class Authentication():
         if returnreply:
             return tokenreply
         self.tokendata = self.tokenreply_to_tokendata(tokenreply)
+        if self.origin:
+            self.tokendata['originheader'] = self.origin
         return self.tokendata
 
     def authenticate_with_code_native(self, code, redirurl, client_secret=None, pkce_secret=None, additionaldata=None, returnreply=False):
@@ -1108,6 +1229,9 @@ class Authentication():
         auth_parser.add_argument('--refresh-token',
                                  action='store',
                                  help='Refresh token (or the word "file" to read it from .roadtools_auth)')
+        auth_parser.add_argument('--origin',
+                                 action='store',
+                                 help='Origin of a browser refresh token from a Single Page Application (i.e. "https://portal.azure.com"). Used with Azure portal or other portal refresh tokens when combind with a client id like -c c44b4083-3bb0-49c1-b47d-974e53cbdf3c.')
         auth_parser.add_argument('--saml-token',
                                  action='store',
                                  help='SAML token from Federation Server')
@@ -1342,6 +1466,10 @@ class Authentication():
             headers = kwargs.get('headers',{})
             headers['User-Agent'] = self.user_agent
             kwargs['headers'] = headers
+        if self.origin:
+            headers = kwargs.get('headers',{})
+            headers['Origin'] = self.origin
+            kwargs['headers'] = headers
         return requests.post(*args, timeout=30.0, **kwargs)
 
     def parse_args(self, args):
@@ -1351,6 +1479,7 @@ class Authentication():
         self.set_client_id(args.client)
         self.access_token = args.access_token
         self.refresh_token = args.refresh_token
+        self.set_origin_value(args.origin)
         self.saml_token = args.saml_token
         self.outfile = args.tokenfile
         self.debug = args.debug
@@ -1396,17 +1525,16 @@ class Authentication():
                 else:
                     samltoken = self.saml_token
                 if self.scope:
-                    # Use v2 endpoint if we have a scope
                     return self.authenticate_with_saml_native_v2(samltoken)
-                else:
-                    return self.authenticate_with_saml_native(samltoken)
+                return self.authenticate_with_saml_native(samltoken)
             if args.as_app and self.password:
                 if self.scope:
                     return self.authenticate_as_app_native_v2()
-                else:
-                    return self.authenticate_as_app_native()
+                return self.authenticate_as_app_native()
             if args.device_code:
-                return self.authenticate_device_code()
+                if self.scope:
+                    return self.authenticate_device_code_native_v2()
+                return self.authenticate_device_code_native()
             if args.prt_init:
                 nonce = self.get_prt_cookie_nonce()
                 if nonce:
@@ -1451,6 +1579,8 @@ class Authentication():
         return False
 
     def save_tokens(self, args):
+        if self.origin:
+            self.tokendata['originheader'] = self.origin
         if args.tokens_stdout:
             sys.stdout.write(json.dumps(self.tokendata))
         else:

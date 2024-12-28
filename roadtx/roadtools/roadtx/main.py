@@ -8,7 +8,7 @@ import base64
 import time
 from collections import defaultdict
 from urllib.parse import quote_plus
-from roadtools.roadlib.auth import Authentication, get_data
+from roadtools.roadlib.auth import Authentication, get_data, AuthenticationException
 from roadtools.roadlib.constants import WELLKNOWN_CLIENTS, WELLKNOWN_RESOURCES, WELLKNOWN_USER_AGENTS
 from roadtools.roadlib.deviceauth import DeviceAuthentication
 from roadtools.roadtx.selenium import SeleniumAuthentication
@@ -21,6 +21,7 @@ def main():
     # Primary argument parser
     parser = argparse.ArgumentParser(add_help=True, description=RR_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('-p', '--proxy', action='store', help="Proxy requests through a proxy (format: proxyip:port). Ignores TLS validation if specified, unless --secure is used.")
+    parser.add_argument('-pt', '--proxy-type', action='store', default="http", help="Proxy type to use. Supported: http / socks4 / socks5. Default: http")
     parser.add_argument('-s', '--secure', action='store_true', help="Enforce certificate validation even if using a proxy")
 
     # Add subparsers for modules
@@ -43,6 +44,7 @@ def main():
                                  action='store',
                                  help='Resource to authenticate to. Either a full URL or alias (list with roadtx listaliases)',
                                  default='https://graph.windows.net')
+    rttsauth_parser.add_argument('--refresh-token', action='store', help='Custom refresh token to use instead of taking it from the tokenfile')
     rttsauth_parser.add_argument('-p', '--password', action='store', metavar='PASSWORD', help='Password secret of the application if not a public app')
     rttsauth_parser.add_argument('-s',
                                  '--scope',
@@ -76,10 +78,13 @@ def main():
     device_parser.add_argument('-c', '--cert-pem', action='store', metavar='file', help='Certificate file to save device cert to (default: <devicename>.pem)')
     device_parser.add_argument('-k', '--key-pem', action='store', metavar='file', help='Private key file for certificate (default: <devicename>.key)')
     device_parser.add_argument('-n', '--name', action='store', help='Device display name (default: DESKTOP-<RANDOM>)')
+    device_parser.add_argument('-d','--domain',action='store',help='Target domain to join to (default: iminyour.cloud)')
     device_parser.add_argument('--access-token', action='store', help='Access token for device registration service. If not specified, taken from .roadtools_auth')
     device_parser.add_argument('--device-type', action='store', help='Device OS type (default: Windows)')
     device_parser.add_argument('--os-version', action='store', help='Device OS version (default: 10.0.19041.928)')
     device_parser.add_argument('--deviceticket', action='store', help='Device MSA ticket to match with existing device')
+    device_parser.add_argument('-ua', '--user-agent', action='store',
+                               help='Custom request user agent to use. Default: Depends on device type')
 
     # Construct hybrid device module
     hdevice_parser = subparsers.add_parser('hybriddevice', help='Join an on-prem device to Azure AD')
@@ -89,10 +94,13 @@ def main():
     hdevice_parser.add_argument('--pfx-pass', action='store', metavar='password', help='PFX file password')
     hdevice_parser.add_argument('--pfx-base64', action='store', metavar='BASE64', help='PFX file as base64 string')
     hdevice_parser.add_argument('-n', '--name', action='store', help='Device display name (default: DESKTOP-<RANDOM>)')
+    hdevice_parser.add_argument('-d','--domain',action='store',help='Target domain to join to (default: iminyour.cloud)')
     hdevice_parser.add_argument('--device-type', action='store', help='Device OS type (default: Windows)')
     hdevice_parser.add_argument('--os-version', action='store', help='Device OS version (default: 10.0.19041.928)')
     hdevice_parser.add_argument('--sid', action='store', required=True, help='Device SID in AD')
     hdevice_parser.add_argument('-t', '--tenant', action='store', required=True, help='Tenant ID where device exists')
+    hdevice_parser.add_argument('-ua', '--user-agent', action='store',
+                                help='Custom user agent to use. Default: Python requests user agent')
 
     # Construct PRT module
     prt_parser = subparsers.add_parser('prt', help='PRT request/renewal module')
@@ -121,10 +129,17 @@ def main():
     prt_parser.add_argument('-s', '--prt-sessionkey', action='store', help='Primary Refresh Token session key (as hex key)')
 
     prt_parser.add_argument('-hk', '--hello-key', action='store', help='Windows Hello PEM file')
+    prt_parser.add_argument('-ha', '--hello-assertion', action='store', help='Windows Hello assertion as JWT')
+
+    prt_parser.add_argument('-ua', '--user-agent', action='store',
+                            help='Custom user agent to use. Default: Python requests user agent')
+
     # Construct winhello module
     winhello_parser = subparsers.add_parser('winhello', help='Register Windows Hello key')
     winhello_parser.add_argument('-k', '--key-pem', action='store', metavar='file', help='Private key file for key storage (default: winhello.key)')
     winhello_parser.add_argument('--access-token', action='store', help='Access token for device registration service. If not specified, taken from .roadtools_auth')
+    winhello_parser.add_argument('-ua', '--user-agent', action='store',
+                                 help='Custom user agent to use. Default: Dsreg/10.0 (Windows 10.0.19044.1826)')
 
     # Construct winhello key generation module - included for reference
     # winhello_parser = subparsers.add_parser('genhellokey', help='Generate Windows Hello key')
@@ -170,17 +185,19 @@ def main():
                                 action='store_true',
                                 help='Request Continuous Access Evaluation tokens')
 
-
+    prtauth_parser.add_argument('-s',
+                                '--scope',
+                                action='store',
+                                help='Scope to use. Will automatically switch to v2.0 auth endpoint if specified. If unsure use -r instead.')
     prtauth_parser.add_argument('-v3', '--prt-protocol-v3', action='store_true', help='Use PRT protocol version v3')
 
     # Application auth
     appauth_parser = subparsers.add_parser('appauth', help='Authenticate as an application')
-    helptext = 'Client ID (application ID) to use when authenticating.'
     appauth_parser.add_argument('-c',
                                 '--client',
                                 action='store',
-                                help=helptext,
-                                default='1b730954-1685-4b74-9bfd-dac224a7b894')
+                                help='Client ID (application ID) to use when authenticating.',
+                                required=True)
     appauth_parser.add_argument('-p',
                                 '--password',
                                 action='store',
@@ -216,6 +233,96 @@ def main():
     appauth_parser.add_argument('--tokens-stdout',
                                 action='store_true',
                                 help='Do not store tokens on disk, pipe to stdout instead')
+
+    # Federated application auth
+    fedauth_parser = subparsers.add_parser('federatedappauth', help='Authenticate as an application with federated credentials')
+    fedauth_parser.add_argument('-c',
+                                '--client',
+                                action='store',
+                                help='Client ID (application ID) to use when authenticating.',
+                                required=True)
+    fedauth_parser.add_argument('-r',
+                                '--resource',
+                                action='store',
+                                help='Resource to authenticate to. Either a full URL or alias (list with roadtx listaliases)',
+                                default='https://graph.windows.net')
+    fedauth_parser.add_argument('-s',
+                                '--scope',
+                                action='store',
+                                help='Scope to use. Will automatically switch to v2.0 auth endpoint if specified. If unsure use -r instead.')
+    fedauth_parser.add_argument('-t',
+                                '--tenant',
+                                action='store',
+                                help='Tenant ID or domain to auth to',
+                                required=True)
+    fedauth_parser.add_argument('--subject',
+                                action='store',
+                                help='Authentication subject as configured in federated credential',
+                                required=True)
+    fedauth_parser.add_argument('--audience',
+                                action='store',
+                                help='Audience of the federated assertion (default: api://AzureADTokenExchange)',
+                                default='api://AzureADTokenExchange')
+    fedauth_parser.add_argument('-i',
+                                '--issuer',
+                                action='store',
+                                help='Issuer as configured in federated credential',
+                                required=True)
+    fedauth_parser.add_argument('-k',
+                                '--kid',
+                                action='store',
+                                help='Key ID configured (default: SHA1 thumbprint of certificate, if provided)')
+    fedauth_parser.add_argument('--cert-pem', action='store', metavar='file', help='Certificate file with IdP certificate')
+    fedauth_parser.add_argument('--key-pem', action='store', metavar='file', help='Private key file for IdP')
+    fedauth_parser.add_argument('--cert-pfx', action='store', metavar='file', help='IdP cert and key as PFX file')
+    fedauth_parser.add_argument('--pfx-pass', action='store', metavar='password', help='PFX file password')
+    fedauth_parser.add_argument('--pfx-base64', action='store', metavar='BASE64', help='PFX file as base64 string')
+    fedauth_parser.add_argument('--cae',
+                                action='store_true',
+                                help='Request Continuous Access Evaluation tokens (requires use of scope parameter instead of resource)')
+    fedauth_parser.add_argument('-ua', '--user-agent', action='store',
+                                help='Custom user agent to use. Default: Python requests user agent')
+    fedauth_parser.add_argument('--tokenfile',
+                                action='store',
+                                help='File to store the credentials (default: .roadtools_auth)',
+                                default='.roadtools_auth')
+    fedauth_parser.add_argument('--tokens-stdout',
+                                action='store_true',
+                                help='Do not store tokens on disk, pipe to stdout instead')
+
+    # Construct device token module
+    devauth_parser = subparsers.add_parser('deviceauth', aliases=('getdevicetokens', 'getdevicetoken'), help='Request device tokens with device cert')
+    devauth_parser.add_argument('-c', '--cert-pem', action='store', metavar='file', help='Certificate file with device certificate')
+    devauth_parser.add_argument('-k', '--key-pem', action='store', metavar='file', help='Private key file for device')
+    devauth_parser.add_argument('--cert-pfx', action='store', metavar='file', help='Device cert and key as PFX file')
+    devauth_parser.add_argument('--pfx-pass', action='store', metavar='password', help='PFX file password')
+    devauth_parser.add_argument('--pfx-base64', action='store', metavar='BASE64', help='PFX file as base64 string')
+    helptext = 'Client ID to use when authenticating.'
+    devauth_parser.add_argument('--client',
+                                action='store',
+                                help=helptext,
+                                default='1b730954-1685-4b74-9bfd-dac224a7b894')
+    devauth_parser.add_argument('-r',
+                                '--resource',
+                                action='store',
+                                help='Resource to authenticate to. Either a full URL or alias (list with roadtx listaliases)',
+                                default='https://graph.windows.net')
+    devauth_parser.add_argument('-ru', '--redirect-url', action='store', metavar='URL',
+                                 help='Custom redirect URL used when authenticating (default: ms-appx-web://Microsoft.AAD.BrokerPlugin/<clientid>)')
+    devauth_parser.add_argument('--tokenfile',
+                                action='store',
+                                help='File to store the credentials (default: .roadtools_auth)',
+                                default='.roadtools_auth')
+    devauth_parser.add_argument('--tokens-stdout',
+                                action='store_true',
+                                help='Do not store tokens on disk, pipe to stdout instead')
+    devauth_parser.add_argument('-ua', '--user-agent', action='store',
+                                help='Custom user agent to use. Default: Python requests user agent')
+    devauth_parser.add_argument('-t',
+                                '--tenant',
+                                required=True,
+                                action='store',
+                                help='Tenant ID or domain to auth to')
 
     # Code grant flow auth
     codeauth_parser = subparsers.add_parser('codeauth', help='Code grant flow - exchange code for auth tokens')
@@ -255,6 +362,8 @@ def main():
     codeauth_parser.add_argument('code',
                                  action='store',
                                  help="Code to auth with that you got from Azure AD")
+    codeauth_parser.add_argument('-ua', '--user-agent', action='store',
+                                 help='Custom user agent to use. Default: Python requests user agent')
 
     # Bulk enrollment token
     bulkenrollment_parser = subparsers.add_parser('bulkenrollmenttoken', help='Request / use bulk enrollment tokens')
@@ -601,6 +710,12 @@ def main():
                                 action='store_true',
                                 help='Do not store tokens on disk, pipe to stdout instead')
 
+    # OWA Login with token
+    owalogin_parser = subparsers.add_parser('owalogin', help='Login to OWA with token')
+    owalogin_parser.add_argument('--access-token', action='store', help='Access token for Outlook. If not specified, taken from .roadtools_auth')
+    owalogin_parser.add_argument('-ua', '--user-agent', action='store',
+                                 help='Custom user agent to use. By default the user agent from FireFox is used without modification')
+
     # ADFS Encrypted blob decrypt
     adfsdec_parser = subparsers.add_parser('decryptadfskey', help='Decrypt Encrypted PFX blob from ADFSpoof into PEM or PFX file')
     adfsdec_parser.add_argument('-c', '--cert-pem', action='store', metavar='file', default='roadtx_adfs.pem', help='Certificate file to save ADFS cert (default: roadtx_adfs.pem)')
@@ -639,15 +754,13 @@ def main():
         sys.exit(1)
         return
 
-    deviceauth = DeviceAuthentication(auth)
     args = parser.parse_args()
-    seleniumproxy = None
+    deviceauth = DeviceAuthentication(auth)
 
     if args.proxy:
         auth.proxies = deviceauth.proxies = {
-            'https': f'http://{args.proxy}'
+            'https': f'{args.proxy_type}://{args.proxy}'
         }
-        seleniumproxy = f'http://{args.proxy}'
         if not args.secure:
             auth.verify = deviceauth.verify = False
 
@@ -663,13 +776,23 @@ def main():
             return
         auth.save_tokens(args)
     elif args.command == 'refreshtokento':
-        try:
-            with codecs.open('.roadtools_auth', 'r', 'utf-8') as infile:
-                tokenobject = json.load(infile)
-            _, tokendata = auth.parse_accesstoken(tokenobject['accessToken'])
-        except FileNotFoundError:
-            print('This command requires the .roadtools_auth file, which was not found. Use the gettokens command to supply a refresh token manually.')
-            return
+        if args.refresh_token:
+            if not args.client:
+                print('The client argument (-c) is required when specifying a custom refresh token')
+                return
+            # Allow overriding the token
+            tokenobject = {
+                'refreshToken':args.refresh_token,
+                '_clientId': args.client
+            }
+        else:
+            try:
+                with codecs.open('.roadtools_auth', 'r', 'utf-8') as infile:
+                    tokenobject = json.load(infile)
+                _, tokendata = auth.parse_accesstoken(tokenobject['accessToken'])
+            except FileNotFoundError:
+                print('This command requires the .roadtools_auth file, which was not found. Use the gettokens command to supply a refresh token manually.')
+                return
         auth.set_client_id(tokenobject['_clientId'])
         auth.set_resource_uri(args.resource)
         auth.set_user_agent(args.user_agent)
@@ -688,12 +811,21 @@ def main():
                 print(f'Requesting token with scope {args.scope}')
             else:
                 print(f'Requesting token for resource {auth.resource_uri}')
-        if args.scope:
-            auth.scope = args.scope
-            auth.authenticate_with_refresh_native_v2(tokenobject['refreshToken'], client_secret=args.password)
-        else:
-            auth.authenticate_with_refresh_native(tokenobject['refreshToken'], client_secret=args.password)
-        auth.save_tokens(args)
+        try:
+            if args.scope:
+                auth.scope = args.scope
+                auth.authenticate_with_refresh_native_v2(tokenobject['refreshToken'], client_secret=args.password)
+            else:
+                auth.authenticate_with_refresh_native(tokenobject['refreshToken'], client_secret=args.password)
+            auth.save_tokens(args)
+        except AuthenticationException as ex:
+            try:
+                error_data = json.loads(str(ex))
+                print(f"Error during authentication: {error_data['error_description']}")
+            except TypeError:
+                # No json
+                print(str(ex))
+            sys.exit(1)
     elif args.command == 'appauth':
         auth.set_client_id(args.client)
         auth.set_resource_uri(args.resource)
@@ -701,6 +833,11 @@ def main():
         auth.use_cae = args.cae
         auth.tenant = args.tenant
         auth.outfile = args.tokenfile
+        if not args.tokens_stdout:
+            if args.scope:
+                print(f'Requesting token with scope {auth.scope}')
+            else:
+                print(f'Requesting token for resource {auth.resource_uri}')
         if args.password:
             # Password based flow
             if args.scope:
@@ -717,7 +854,28 @@ def main():
                 assertion = auth.generate_app_assertion(use_v2=False)
                 auth.authenticate_as_app_native(assertion=assertion)
         auth.save_tokens(args)
+    elif args.command == 'federatedappauth':
+        auth.set_client_id(args.client)
+        auth.set_resource_uri(args.resource)
+        auth.scope = args.scope
+        auth.use_cae = args.cae
+        auth.tenant = args.tenant
+        auth.outfile = args.tokenfile
+        if not args.tokens_stdout:
+            if args.scope:
+                print(f'Requesting token with scope {auth.scope}')
+            else:
+                print(f'Requesting token for resource {auth.resource_uri}')
+        if not auth.loadappcert(args.cert_pem, args.key_pem, args.cert_pfx, args.pfx_pass, args.pfx_base64):
+            return
+        assertion = auth.generate_federated_assertion(iss=args.issuer, sub=args.subject, kid=args.kid, aud=args.audience)
+        if args.scope:
+            auth.authenticate_as_app_native_v2(assertion=assertion)
+        else:
+            auth.authenticate_as_app_native(assertion=assertion)
+        auth.save_tokens(args)
     elif args.command == 'device':
+        auth.set_user_agent(args.user_agent)
         if args.action in ('register', 'join'):
             if args.access_token:
                 tokenobject, tokendata = auth.parse_accesstoken(args.access_token)
@@ -737,16 +895,18 @@ def main():
                 jointype = 0
             else:
                 jointype = 4
-            deviceauth.register_device(tokenobject['accessToken'], jointype=jointype, certout=args.cert_pem, privout=args.key_pem, device_type=args.device_type, device_name=args.name, os_version=args.os_version, deviceticket=args.deviceticket)
+            deviceauth.register_device(tokenobject['accessToken'], jointype=jointype, certout=args.cert_pem, privout=args.key_pem, device_type=args.device_type, device_name=args.name, os_version=args.os_version, deviceticket=args.deviceticket, device_domain=args.domain)
         elif args.action == 'delete':
             if not deviceauth.loadcert(args.cert_pem, args.key_pem):
                 return
             deviceauth.delete_device(args.cert_pem, args.key_pem)
     elif args.command == 'hybriddevice':
+        auth.set_user_agent(args.user_agent)
         if not deviceauth.loadcert(args.cert_pem, args.key_pem, args.cert_pfx, args.pfx_pass, args.pfx_base64):
             return
         deviceauth.register_hybrid_device(args.sid, args.tenant, certout=args.cert_pem, privout=args.key_pem, device_type=args.device_type, device_name=args.name, os_version=args.os_version)
     elif args.command == 'prt':
+        auth.set_user_agent(args.user_agent)
         if args.action == 'request':
             if not deviceauth.loadcert(args.cert_pem, args.key_pem, args.cert_pfx, args.pfx_pass, args.pfx_base64):
                 return
@@ -778,6 +938,8 @@ def main():
 
             if args.username and deviceauth.loadhellokey(args.hello_key):
                 prtdata = deviceauth.get_prt_with_hello_key(args.username)
+            if args.username and args.hello_assertion:
+                prtdata = deviceauth.get_prt_with_hello_key(args.username, args.hello_assertion)
             if not prtdata:
                 print('You must specify a username + password or refresh token that can be used to request a PRT')
                 return
@@ -798,6 +960,7 @@ def main():
     elif args.command == 'prtauth':
         auth.set_user_agent(args.user_agent)
         auth.use_cae = args.cae
+        auth.scope = args.scope
         if args.tenant:
             auth.tenant = args.tenant
         if args.prt and args.prt_sessionkey:
@@ -819,6 +982,17 @@ def main():
         else:
             print('No access token in token data, assuming custom request')
             print(tokendata)
+    elif args.command in ('deviceauth', 'getdevicetoken', 'getdevicetokens'):
+        auth.set_user_agent(args.user_agent)
+        if not deviceauth.loadcert(args.cert_pem, args.key_pem, args.cert_pfx, args.pfx_pass, args.pfx_base64):
+            return
+        auth.set_user_agent(args.user_agent)
+        if args.tenant:
+            auth.tenant = args.tenant
+        tokenreply = deviceauth.get_token_for_device(args.client, args.resource, redirect_uri=args.redirect_url)
+        auth.outfile = args.tokenfile
+        auth.tokendata = auth.tokenreply_to_tokendata(tokenreply)
+        auth.save_tokens(args)
     elif args.command == 'decrypt':
         header, enc_key, iv, ciphertext, auth_tag = auth.parse_compact_jwe(args.data, args.verbose)
         if header['alg'] == 'RSA-OAEP':
@@ -853,6 +1027,7 @@ def main():
     elif args.command == 'codeauth':
         auth.set_client_id(args.client)
         auth.set_resource_uri(args.resource)
+        auth.set_user_agent(args.user_agent)
         auth.tenant = args.tenant
         if args.cae:
             auth.use_cae = args.cae
@@ -903,7 +1078,7 @@ def main():
             auth.scope = args.scope
         # Intercept if custom UA is set
         custom_ua = args.user_agent is not None
-        selauth = SeleniumAuthentication(auth, deviceauth, args.redirect_url, proxy=seleniumproxy)
+        selauth = SeleniumAuthentication(auth, deviceauth, args.redirect_url, proxy=args.proxy, proxy_type=args.proxy_type)
         if args.auth_url:
             url = args.auth_url
         else:
@@ -939,7 +1114,7 @@ def main():
         auth.use_cae = args.cae
         # Intercept if custom UA is set
         custom_ua = args.user_agent is not None
-        selauth = SeleniumAuthentication(auth, deviceauth, args.redirect_url, proxy=seleniumproxy)
+        selauth = SeleniumAuthentication(auth, deviceauth, args.redirect_url, proxy=args.proxy, proxy_type=args.proxy_type)
         password, otpseed = selauth.get_keepass_cred(args.username, args.keepass, args.keepass_password)
         if args.auth_url:
             url = args.auth_url
@@ -949,7 +1124,7 @@ def main():
         if not service:
             return
         selauth.driver = selauth.get_webdriver(service, intercept=custom_ua)
-        if custom_ua:
+        if custom_ua or selauth.redir_has_custom_scheme():
             result = selauth.selenium_login_with_custom_useragent(url, args.username, password, otpseed, keep=args.keep_open, capture=args.capture_code, federated=args.federated, devicecode=args.device_code)
         else:
             result = selauth.selenium_login(url, args.username, password, otpseed, keep=args.keep_open, capture=args.capture_code, federated=args.federated, devicecode=args.device_code)
@@ -975,7 +1150,7 @@ def main():
         else:
             print('You must either supply a PRT and session key on the command line or a file that contains them')
             return
-        selauth = SeleniumAuthentication(auth, deviceauth, args.redirect_url, proxy=seleniumproxy)
+        selauth = SeleniumAuthentication(auth, deviceauth, args.redirect_url, proxy=args.proxy, proxy_type=args.proxy_type)
         if args.auth_url:
             url = args.auth_url
         else:
@@ -1044,6 +1219,12 @@ def main():
             return
         auth.outfile = args.tokenfile
         auth.save_tokens(args)
+        if args.keep_open:
+            try:
+                time.sleep(99999)
+            except KeyboardInterrupt:
+                return
+            return
     elif args.command == 'prtenrich':
         if not args.no_prt:
             if args.prt and args.prt_sessionkey:
@@ -1068,7 +1249,7 @@ def main():
             replyurl = "ms-appx-web://Microsoft.AAD.BrokerPlugin/dd762716-544d-4aeb-a526-687b73838a22"
             url = f'https://login.microsoftonline.com/common/oauth2/authorize?response_type=code&client_id=dd762716-544d-4aeb-a526-687b73838a22&redirect_uri=ms-appx-web%3a%2f%2fMicrosoft.AAD.BrokerPlugin%2fdd762716-544d-4aeb-a526-687b73838a22&resource=urn%3ams-drs%3aenterpriseregistration.windows.net&add_account=noheadsup&scope=openid{hint}&response_mode=form_post&windows_api_version=2.0&amr_values=ngcmfa'
 
-        selauth = SeleniumAuthentication(auth, deviceauth, replyurl, proxy=seleniumproxy)
+        selauth = SeleniumAuthentication(auth, deviceauth, replyurl, proxy=args.proxy, proxy_type=args.proxy_type)
         if args.username and args.keepass and (args.keepass_password or 'KPPASS' in os.environ or args.keepass.endswith('.xml')):
             _, otpseed = selauth.get_keepass_cred(args.username, args.keepass, args.keepass_password)
         else:
@@ -1185,7 +1366,7 @@ def main():
         except ValueError:
             print("No resource (API) specified in scope, defaulting to Microsoft Graph")
             resource = "https://graph.microsoft.com"
-            scope = args.scope
+            scope = args.scope.lower()
 
         try:
             resourceid = data['resourceidentifiers'][resource.lower()]
@@ -1230,6 +1411,7 @@ def main():
                 foci = 'Yes' if app['foci'] else 'No'
                 print(f"{appid:<40} {app['name']:<40} {foci:<7} {scopes}")
     elif args.command == 'winhello':
+        auth.set_user_agent(args.user_agent)
         if args.access_token:
             tokenobject, tokendata = auth.parse_accesstoken(args.access_token)
         else:
@@ -1339,6 +1521,30 @@ def main():
         cookie = auth.create_prt_cookie_kdf_ver_2(deviceauth.prt, deviceauth.session_key, challenge)
         print(f"PRT cookie: {cookie}")
         print("Can be used in external browsers using the x-ms-RefreshTokenCredential header or cookie. Note that a PRT cookie is only valid for 5 minutes.")
+
+    elif args.command == 'owalogin':
+        auth.set_user_agent(args.user_agent)
+        if args.access_token:
+            tokenobject, tokendata = auth.parse_accesstoken(args.access_token)
+        else:
+            try:
+                with codecs.open('.roadtools_auth', 'r', 'utf-8') as infile:
+                    tokenobject = json.load(infile)
+                _, tokendata = auth.parse_accesstoken(tokenobject['accessToken'])
+            except FileNotFoundError:
+                print('No auth data found. Ether supply an access token with --access-token or make sure a token is present on disk in .roadtools_auth')
+                return
+        if tokendata['aud'] not in ['https://outlook.office.com','https://outlook.office365.com','https://outlook.office.com/','00000002-0000-0ff1-ce00-000000000000','https://outlook.office365.com/']:
+            print(f"Wrong token audience, got {tokendata['aud']} but expected: https://outlook.office.com")
+            print("Make sure to request a token with -r https://outlook.office.com")
+            return
+        auth.set_user_agent(args.user_agent)
+        selauth = SeleniumAuthentication(auth, deviceauth, None, proxy=args.proxy, proxy_type=args.proxy_type)
+        service = selauth.get_service(None)
+        if not service:
+            return
+        selauth.driver = selauth.get_webdriver(service, intercept=True)
+        selauth.selenium_login_owatoken(tokenobject['accessToken'])
 
 if __name__ == '__main__':
     main()
